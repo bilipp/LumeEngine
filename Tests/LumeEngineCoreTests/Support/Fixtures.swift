@@ -1,0 +1,61 @@
+import Foundation
+
+/// Locates (and lazily generates) test media fixtures.
+/// Generation shells out to the host `ffmpeg` once per test run; files are
+/// cached in `TestStreams/generated/` (gitignored).
+enum Fixtures {
+    static let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // Support/
+        .deletingLastPathComponent() // LumeEngineCoreTests/
+        .deletingLastPathComponent() // Tests/
+        .deletingLastPathComponent() // repo root
+
+    static let outputDirectory = repoRoot
+        .appendingPathComponent("TestStreams/generated", isDirectory: true)
+
+    private static let scriptURL = repoRoot
+        .appendingPathComponent("Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh")
+
+    private static let generated: Result<Void, Error> = {
+        Result {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [scriptURL.path, outputDirectory.path]
+            var environment = ProcessInfo.processInfo.environment
+            // Prefer Homebrew ffmpeg without requiring PATH setup in Xcode.
+            if environment["FFMPEG"] == nil,
+               FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/ffmpeg") {
+                environment["FFMPEG"] = "/opt/homebrew/bin/ffmpeg"
+            }
+            process.environment = environment
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                throw NSError(
+                    domain: "Fixtures", code: Int(process.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "fixture generation failed"]
+                )
+            }
+        }
+    }()
+
+    /// Returns the fixture URL, generating fixtures on first use.
+    static func url(_ name: String) throws -> URL {
+        try generated.get()
+        let url = outputDirectory.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw NSError(
+                domain: "Fixtures", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "missing fixture \(name)"]
+            )
+        }
+        return url
+    }
+
+    static func path(_ name: String) throws -> String {
+        try url(name).path
+    }
+}

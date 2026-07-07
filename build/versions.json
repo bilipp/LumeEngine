@@ -1,0 +1,17 @@
+{
+  "ffmpeg": {
+    "version": "8.1.2",
+    "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+    "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+  },
+  "dav1d": {
+    "version": "1.5.1",
+    "url": "https://code.videolan.org/videolan/dav1d/-/archive/1.5.1/dav1d-1.5.1.tar.bz2",
+    "status": "planned"
+  },
+  "libass": {
+    "version": "0.17.4",
+    "url": "https://github.com/libass/libass/releases/download/0.17.4/libass-0.17.4.tar.xz",
+    "status": "planned"
+  }
+}

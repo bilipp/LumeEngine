@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LumeEngine}",
+            "name": "Debug LumeEngineDemo",
+            "target": "LumeEngineDemo",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug LumeEngineDemo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LumeEngine}",
+            "name": "Release LumeEngineDemo",
+            "target": "LumeEngineDemo",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release LumeEngineDemo"
+        }
+    ]
+}

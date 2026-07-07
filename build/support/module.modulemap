@@ -1,0 +1,14 @@
+module CFFmpeg {
+    header "CFFmpeg.h"
+    export *
+
+    link "z"
+    link "bz2"
+    link "iconv"
+    link framework "CoreFoundation"
+    link framework "CoreMedia"
+    link framework "CoreVideo"
+    link framework "VideoToolbox"
+    link framework "AudioToolbox"
+    link framework "Security"
+}
