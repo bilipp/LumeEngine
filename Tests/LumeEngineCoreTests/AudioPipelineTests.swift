@@ -8,14 +8,14 @@ import Testing
 /// audible scratch, so assert sample-level continuity on a known signal.
 @Suite("AudioPipeline", .serialized)
 struct AudioPipelineTests {
-    /// Decodes the whole 7.1 sine fixture and returns the frames in order.
-    private func decodeSurround(maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
-        let demuxer = Demuxer(url: try Fixtures.path("surround71.mkv"))
+    /// Decodes an audio-only sine fixture end to end and returns the frames in order.
+    private func decode(fixture: String, maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
+        let demuxer = Demuxer(url: try Fixtures.path(fixture))
         var events = demuxer.events.makeAsyncIterator()
         demuxer.start()
         guard case .opened(let info)? = await events.next() else {
             demuxer.shutdown()
-            throw EngineError(code: .openFailed, message: "surround71.mkv failed to open")
+            throw EngineError(code: .openFailed, message: "\(fixture) failed to open")
         }
         defer { demuxer.shutdown() }
 
@@ -39,6 +39,10 @@ struct AudioPipelineTests {
             collected.append(frame)
         }
         return collected
+    }
+
+    private func decodeSurround(maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
+        try await decode(fixture: "surround71.mkv", maxOutputChannels: maxOutputChannels)
     }
 
     @Test("7.1 decode: PCM is sample-continuous in every channel", .timeLimit(.minutes(1)))
@@ -141,6 +145,56 @@ struct AudioPipelineTests {
             // The regenerated time never drifts far from the container PTS.
             let deviation = abs(pts.convertScale(1_000_000, method: .default).value - frame.pts)
             #expect(deviation < 40_000, "regenerated PTS drifted \(deviation) µs from container PTS")
+        }
+    }
+
+    @Test("TrueHD access units coalesce into schedulable frames, PCM intact", .timeLimit(.minutes(1)))
+    func truehdCoalescing() async throws {
+        // TrueHD decodes to 40-sample frames (0.83 ms at 48 kHz). Uncoalesced,
+        // duration-budgeted frame queues hold ~40 ms of audio and playback
+        // oscillates between buffering and starvation (~1 s crackle cycle).
+        let frames = try await decode(fixture: "truehd.mkv")
+        #expect(!frames.isEmpty)
+        let rate = try #require(frames.first?.sampleRate)
+        let channels = try #require(frames.first?.channels)
+        #expect(channels == 6)
+
+        // Every frame except the EOF tail must meet the coalescing floor (20 ms).
+        let floor = Int(0.020 * Double(rate))
+        for frame in frames.dropLast() {
+            #expect(
+                frame.sampleCount >= floor,
+                "frame at \(frame.pts) µs is \(frame.sampleCount) samples — below the coalescing floor \(floor)"
+            )
+        }
+
+        // Nothing lost or duplicated by coalescing: full duration survives...
+        let totalSeconds = Double(frames.reduce(0) { $0 + $1.sampleCount }) / Double(rate)
+        #expect(abs(totalSeconds - 4.0) < 0.1, "expected ~4 s of audio, got \(totalSeconds)")
+
+        // ...and the sine stays continuous across every coalesced boundary
+        // (an offset-write bug in the accumulator would step here).
+        let maxStep = Float(3.0 * 2.0 * Double.pi * 440.0 / Double(rate))
+        var perChannel: [[Float]] = Array(repeating: [], count: channels)
+        for frame in frames {
+            let samples = frame.samples
+            for index in 0..<frame.sampleCount {
+                for channel in 0..<channels {
+                    perChannel[channel].append(samples[index * channels + channel])
+                }
+            }
+        }
+        for (channel, signal) in perChannel.enumerated() {
+            let amplitude = signal.map(abs).max() ?? 0
+            guard amplitude > 0.01 else { continue }
+            var worst: Float = 0
+            for index in 1..<signal.count {
+                worst = max(worst, abs(signal[index] - signal[index - 1]))
+            }
+            #expect(
+                worst <= maxStep * amplitude,
+                "channel \(channel): sample step \(worst) exceeds sine slope bound \(maxStep * amplitude)"
+            )
         }
     }
 

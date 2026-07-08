@@ -7,6 +7,7 @@
 #   wrap.ts        — MPEG-TS whose raw 33-bit timestamps wrap mid-file
 #   multitrack.mkv — video + 2 audio languages + SRT subtitles + chapters
 #   surround71.mkv — FLAC 7.1 audio-only
+#   truehd.mkv     — TrueHD 5.1 audio-only (40-sample access units)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -40,6 +41,14 @@ gen surround71.mkv \
     -f lavfi -i "sine=frequency=440:duration=4" \
     -af "aformat=channel_layouts=7.1" \
     -c:a flac
+
+# TrueHD decodes to 40-sample access units (0.83 ms at 48 kHz, 1200 frames/s) —
+# the extreme small-frame case the audio decoder must coalesce, or downstream
+# frame queues hold almost no audio. Encoder is experimental, hence -strict -2.
+gen truehd.mkv \
+    -f lavfi -i "sine=frequency=440:duration=4" \
+    -af "aformat=channel_layouts=5.1(side):sample_rates=48000" \
+    -c:a truehd -strict -2
 
 if [ ! -f "$OUT/multitrack.mkv" ]; then
     cat > "$OUT/subs.srt" <<'SRT'

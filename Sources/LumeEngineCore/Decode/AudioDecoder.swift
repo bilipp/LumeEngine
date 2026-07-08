@@ -14,6 +14,13 @@ import Foundation
 /// renderer more channels than the route supports produces audibly broken
 /// output. Resampling context is rebuilt automatically when source parameters
 /// change mid-stream (codec/parameter changes are routine on IPTV).
+///
+/// Decoded frames are coalesced to at least `minOutputDuration` before
+/// emission. Some codecs decode to frames far too small to schedule
+/// individually — TrueHD produces 40-sample access units (0.83 ms at 48 kHz,
+/// 1200 frames/s), at which point duration-budgeted frame queues hold almost
+/// no audio and per-buffer costs swamp the render path. Common codecs
+/// (AAC 1024, AC-3 1536 samples) already exceed the floor and pass through 1:1.
 public final class AudioDecoder: @unchecked Sendable {
     public let events: AsyncStream<DecodeEvent>
     private let eventSink: AsyncStream<DecodeEvent>.Continuation
@@ -38,6 +45,18 @@ public final class AudioDecoder: @unchecked Sendable {
     private var outputLayout = AVChannelLayout()
     private var currentSerial: UInt64?
     private var consecutiveErrors = 0
+
+    // Coalescing buffer (decode-thread-only): converted samples accumulate
+    // here until `minOutputDuration` is reached.
+    private var pendingFrame: UnsafeMutablePointer<AVFrame>?
+    private var pendingCapacity: Int32 = 0
+    private var pendingFilled: Int32 = 0
+    private var pendingPTS: Int64 = MediaTime.noTimestamp
+    private var pendingSerial: UInt64 = 0
+
+    /// Emission floor in seconds; see the type docs for why tiny decoded
+    /// frames must not reach the frame queue individually.
+    private static let minOutputDuration = 0.020
 
     private let maxConsecutiveErrors = 100
     private let maxOutputChannels: Int
@@ -168,6 +187,7 @@ public final class AudioDecoder: @unchecked Sendable {
 
             if let serial = currentSerial, serial != packet.serial {
                 avcodec_flush_buffers(codecContext)
+                dropPending() // pre-seek samples must not merge into the new serial
             }
             currentSerial = packet.serial
 
@@ -207,44 +227,92 @@ public final class AudioDecoder: @unchecked Sendable {
         }
     }
 
-    /// Resamples to interleaved Float32 and hands off an owned AVFrame.
+    /// Resamples to interleaved Float32 into the pending coalescing buffer,
+    /// emitting an owned AVFrame once `minOutputDuration` has accumulated.
     private func deliver(frame source: UnsafeMutablePointer<AVFrame>) {
         guard ensureResampler(for: source) else { return }
 
-        guard let converted = av_frame_alloc() else { return }
-        converted.pointee.sample_rate = source.pointee.sample_rate
-        converted.pointee.format = AV_SAMPLE_FMT_FLT.rawValue
-        av_channel_layout_copy(&converted.pointee.ch_layout, &outputLayout)
-        // swr may buffer; size output generously.
-        converted.pointee.nb_samples = source.pointee.nb_samples + 256
+        // swr may buffer a few samples internally; reserve slack beyond the input.
+        let required = source.pointee.nb_samples + 256
+        if pendingFrame != nil, pendingCapacity - pendingFilled < required {
+            emitPending()
+        }
+        if pendingFrame == nil {
+            let floor = Int32(Self.minOutputDuration * Double(source.pointee.sample_rate))
+            guard allocatePending(capacity: floor + required, sampleRate: source.pointee.sample_rate) else {
+                return
+            }
+        }
+        guard let pending = pendingFrame else { return }
 
-        guard av_frame_get_buffer(converted, 0) >= 0 else {
-            var pointer: UnsafeMutablePointer<AVFrame>? = converted
-            av_frame_free(&pointer)
-            return
+        if pendingFilled == 0 {
+            pendingPTS = source.pointee.best_effort_timestamp
+            pendingSerial = currentSerial ?? 0
         }
 
+        let channels = Int(pending.pointee.ch_layout.nb_channels)
         let sourcePlanes = UnsafeRawPointer(source.pointee.extended_data)?
             .assumingMemoryBound(to: UnsafePointer<UInt8>?.self)
-        let produced = swr_convert(
-            swrContext,
-            converted.pointee.extended_data, converted.pointee.nb_samples,
-            sourcePlanes, source.pointee.nb_samples
-        )
-        guard produced > 0 else {
-            var pointer: UnsafeMutablePointer<AVFrame>? = converted
-            av_frame_free(&pointer)
-            if produced < 0 { handleDecodeError(produced) }
+        var writeHead: UnsafeMutablePointer<UInt8>? = pending.pointee.data.0!
+            + Int(pendingFilled) * channels * MemoryLayout<Float>.size
+        let produced = withUnsafeMutablePointer(to: &writeHead) { destination in
+            swr_convert(
+                swrContext,
+                destination, pendingCapacity - pendingFilled,
+                sourcePlanes, source.pointee.nb_samples
+            )
+        }
+        guard produced >= 0 else {
+            handleDecodeError(produced)
             return
         }
-        converted.pointee.nb_samples = produced
+        pendingFilled += produced
 
-        let audioFrame = AudioFrame(
-            adopting: converted,
-            pts: source.pointee.best_effort_timestamp,
-            serial: currentSerial ?? 0
-        )
+        let floor = Int32(Self.minOutputDuration * Double(pending.pointee.sample_rate))
+        if pendingFilled >= floor {
+            emitPending()
+        }
+    }
+
+    private func allocatePending(capacity: Int32, sampleRate: Int32) -> Bool {
+        guard let frame = av_frame_alloc() else { return false }
+        frame.pointee.sample_rate = sampleRate
+        frame.pointee.format = AV_SAMPLE_FMT_FLT.rawValue
+        av_channel_layout_copy(&frame.pointee.ch_layout, &outputLayout)
+        frame.pointee.nb_samples = capacity
+        guard av_frame_get_buffer(frame, 0) >= 0 else {
+            var pointer: UnsafeMutablePointer<AVFrame>? = frame
+            av_frame_free(&pointer)
+            return false
+        }
+        pendingFrame = frame
+        pendingCapacity = capacity
+        pendingFilled = 0
+        return true
+    }
+
+    /// Sends whatever has accumulated (a partial buffer is fine — emission
+    /// points are the duration floor, EOF drain, and format changes).
+    private func emitPending() {
+        guard let pending = pendingFrame else { return }
+        pendingFrame = nil
+        guard pendingFilled > 0 else {
+            var pointer: UnsafeMutablePointer<AVFrame>? = pending
+            av_frame_free(&pointer)
+            return
+        }
+        pending.pointee.nb_samples = pendingFilled
+        pendingFilled = 0
+        let audioFrame = AudioFrame(adopting: pending, pts: pendingPTS, serial: pendingSerial)
         try? output.send(audioFrame)
+    }
+
+    private func dropPending() {
+        guard let pending = pendingFrame else { return }
+        pendingFrame = nil
+        pendingFilled = 0
+        var pointer: UnsafeMutablePointer<AVFrame>? = pending
+        av_frame_free(&pointer)
     }
 
     private func ensureResampler(for frame: UnsafeMutablePointer<AVFrame>) -> Bool {
@@ -256,6 +324,7 @@ public final class AudioDecoder: @unchecked Sendable {
             return true
         }
 
+        emitPending() // samples of the previous format cannot share a buffer
         swr_free(&swrContext)
         // swr needs concrete layouts on both sides to build a (down)mix
         // matrix; sources reporting an unspecified order (routine for PCM)
@@ -295,6 +364,7 @@ public final class AudioDecoder: @unchecked Sendable {
         guard let context = codecContext else { return }
         avcodec_send_packet(context, nil)
         receiveFrames(into: frame)
+        emitPending() // the tail below the coalescing floor still belongs to the stream
         avcodec_flush_buffers(context)
         eventSink.yield(.endOfStream(serial: currentSerial ?? 0))
     }
@@ -335,6 +405,7 @@ public final class AudioDecoder: @unchecked Sendable {
     }
 
     private func finishThread() {
+        dropPending()
         avcodec_free_context(&codecContext)
         swr_free(&swrContext)
         av_channel_layout_uninit(&outputLayout)
