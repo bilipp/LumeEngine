@@ -1,4 +1,50 @@
+internal import CFFmpeg
 import CoreMedia
+
+/// Regenerates sample-contiguous presentation times for audio buffers.
+///
+/// Container audio PTS carry container-timebase quantization (MKV stores
+/// milliseconds: up to ±0.5 ms per packet). The audio renderer aligns each
+/// buffer to its timestamp, so stamping buffers with quantized PTS makes it
+/// splice — drop or insert samples — at every buffer boundary, which is
+/// audible as continuous crackling. Like mpv's ao_avfoundation, anchor once
+/// and advance by exact sample counts; fall back to the container PTS only on
+/// genuine discontinuities (seek flush, stream gap, format change).
+struct AudioTimeline {
+    /// Anything below this is timestamp quantization/jitter to be absorbed;
+    /// anything above is a real gap the synchronizer must see.
+    private static let discontinuityToleranceUs: Int64 = 40_000
+
+    private var anchorSampleValue: Int64 = 0
+    private var samplesSinceAnchor: Int64 = 0
+    private var sampleRate = 0
+    private var serial: UInt64 = 0
+    private var hasAnchor = false
+
+    mutating func reset() {
+        hasAnchor = false
+    }
+
+    /// Sample-accurate presentation time for `frame` (timescale = sample rate,
+    /// so buffer boundaries land exactly on the sample grid).
+    mutating func presentationTime(for frame: AudioFrame) -> CMTime {
+        if hasAnchor, frame.sampleRate == sampleRate, frame.serial == serial {
+            let expectedValue = anchorSampleValue + samplesSinceAnchor
+            let expectedUs = av_rescale(expectedValue, 1_000_000, Int64(sampleRate))
+            if !MediaTime.isValid(frame.pts) || abs(frame.pts - expectedUs) <= Self.discontinuityToleranceUs {
+                samplesSinceAnchor += Int64(frame.sampleCount)
+                return CMTime(value: expectedValue, timescale: CMTimeScale(sampleRate))
+            }
+        }
+        sampleRate = frame.sampleRate
+        serial = frame.serial
+        let pts = MediaTime.isValid(frame.pts) ? frame.pts : 0
+        anchorSampleValue = av_rescale(pts, Int64(sampleRate), 1_000_000)
+        samplesSinceAnchor = Int64(frame.sampleCount)
+        hasAnchor = true
+        return CMTime(value: anchorSampleValue, timescale: CMTimeScale(sampleRate))
+    }
+}
 
 /// Builds `CMSampleBuffer`s from decoded engine frames. All timestamps use the
 /// engine timescale (microseconds), so the render synchronizer's timeline is
@@ -50,11 +96,19 @@ enum SampleBufferBuilder {
 
     /// Wraps a decoded audio frame (interleaved Float32) by copying its samples
     /// into a block buffer.
+    /// `AudioChannelBitmap` bit positions match the `AV_CH_*` mask (both follow
+    /// WAVE order) for bits 0...17, which covers every standard layout up to 7.1.
+    private static let waveCompatibleChannelBits: UInt64 = 0x3FFFF
+
     static func audio(
         from frame: AudioFrame,
-        formatCache: inout (description: CMAudioFormatDescription, sampleRate: Int, channels: Int)?
+        presentationTime: CMTime,
+        formatCache: inout (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
     ) throws -> CMSampleBuffer {
-        if formatCache == nil || formatCache!.sampleRate != frame.sampleRate || formatCache!.channels != frame.channels {
+        if formatCache == nil
+            || formatCache!.sampleRate != frame.sampleRate
+            || formatCache!.channels != frame.channels
+            || formatCache!.channelBitmap != frame.channelBitmap {
             var asbd = AudioStreamBasicDescription(
                 mSampleRate: Float64(frame.sampleRate),
                 mFormatID: kAudioFormatLinearPCM,
@@ -66,21 +120,31 @@ enum SampleBufferBuilder {
                 mBitsPerChannel: 32,
                 mReserved: 0
             )
+            // The audio renderer needs the channel layout to map and downmix
+            // anything beyond stereo; without it multichannel renders as noise.
+            let useBitmap = frame.channelBitmap != 0
+                && frame.channelBitmap & ~waveCompatibleChannelBits == 0
+                && frame.channelBitmap.nonzeroBitCount == frame.channels
+            var layout = AudioChannelLayout()
+            layout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelBitmap
+            layout.mChannelBitmap = AudioChannelBitmap(rawValue: UInt32(truncatingIfNeeded: frame.channelBitmap))
             var description: CMAudioFormatDescription?
-            let status = CMAudioFormatDescriptionCreate(
-                allocator: kCFAllocatorDefault,
-                asbd: &asbd,
-                layoutSize: 0,
-                layout: nil,
-                magicCookieSize: 0,
-                magicCookie: nil,
-                extensions: nil,
-                formatDescriptionOut: &description
-            )
+            let status = withUnsafePointer(to: layout) { layoutPointer in
+                CMAudioFormatDescriptionCreate(
+                    allocator: kCFAllocatorDefault,
+                    asbd: &asbd,
+                    layoutSize: useBitmap ? MemoryLayout<AudioChannelLayout>.size : 0,
+                    layout: useBitmap ? layoutPointer : nil,
+                    magicCookieSize: 0,
+                    magicCookie: nil,
+                    extensions: nil,
+                    formatDescriptionOut: &description
+                )
+            }
             guard status == noErr, let description else {
                 throw EngineError(code: .internalError, message: "CMAudioFormatDescription failed (\(status))")
             }
-            formatCache = (description, frame.sampleRate, frame.channels)
+            formatCache = (description, frame.sampleRate, frame.channels, frame.channelBitmap)
         }
 
         let byteCount = frame.sampleCount * frame.channels * MemoryLayout<Float>.size
@@ -117,7 +181,7 @@ enum SampleBufferBuilder {
             dataBuffer: blockBuffer,
             formatDescription: formatCache!.description,
             sampleCount: frame.sampleCount,
-            presentationTimeStamp: time(frame.pts),
+            presentationTimeStamp: presentationTime,
             packetDescriptions: nil,
             sampleBufferOut: &sampleBuffer
         )

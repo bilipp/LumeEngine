@@ -34,7 +34,9 @@ public final class SystemRenderer: @unchecked Sendable {
 
     // Queue-confined format caches.
     private var videoFormatCache: CMVideoFormatDescription?
-    private var audioFormatCache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int)?
+    private var audioFormatCache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
+    // Audio-queue-confined; serial changes re-anchor it after a seek flush.
+    private var audioTimeline = AudioTimeline()
 
     public init(muted: Bool = false) {
         displayLayer = AVSampleBufferDisplayLayer()
@@ -188,7 +190,11 @@ public final class SystemRenderer: @unchecked Sendable {
             }
             guard frame.serial == serial else { continue }
             do {
-                let sample = try SampleBufferBuilder.audio(from: frame, formatCache: &audioFormatCache)
+                let sample = try SampleBufferBuilder.audio(
+                    from: frame,
+                    presentationTime: audioTimeline.presentationTime(for: frame),
+                    formatCache: &audioFormatCache
+                )
                 audioRenderer.enqueue(sample)
                 lock.lock()
                 lastEnqueuedAudioPTS = frame.pts + frame.duration

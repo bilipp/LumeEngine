@@ -6,6 +6,7 @@
 #   basic.mp4      — H.264 + AAC, 10 s VOD
 #   wrap.ts        — MPEG-TS whose raw 33-bit timestamps wrap mid-file
 #   multitrack.mkv — video + 2 audio languages + SRT subtitles + chapters
+#   surround71.mkv — FLAC 7.1 audio-only
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -32,6 +33,13 @@ gen wrap.ts \
     -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
     -c:a aac -shortest \
     -muxdelay 0 -output_ts_offset 95440 -f mpegts
+
+# 7.1 FLAC: exercises the multichannel path (channel layout must survive
+# decode → resample → CMSampleBuffer, or the renderer plays noise).
+gen surround71.mkv \
+    -f lavfi -i "sine=frequency=440:duration=4" \
+    -af "aformat=channel_layouts=7.1" \
+    -c:a flac
 
 if [ ! -f "$OUT/multitrack.mkv" ]; then
     cat > "$OUT/subs.srt" <<'SRT'

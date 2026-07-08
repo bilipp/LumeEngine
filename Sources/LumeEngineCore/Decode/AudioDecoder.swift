@@ -1,13 +1,19 @@
 internal import CFFmpeg
+#if canImport(UIKit)
+import AVFAudio
+#endif
 import Foundation
 
 /// FFmpeg audio decode + resample stage: `Channel<Packet>` in,
 /// `Channel<AudioFrame>` out.
 ///
-/// Output is always interleaved Float32 at the source sample rate and channel
-/// count — the single canonical format the renderer consumes. Resampling
-/// context is rebuilt automatically when source parameters change mid-stream
-/// (codec/parameter changes are routine on IPTV).
+/// Output is always interleaved Float32 at the source sample rate, downmixed
+/// to at most `maxOutputChannels` — the single canonical format the renderer
+/// consumes. Sources with more channels than the output route can carry are
+/// downmixed here by swresample (normalized matrix); handing the sample-buffer
+/// renderer more channels than the route supports produces audibly broken
+/// output. Resampling context is rebuilt automatically when source parameters
+/// change mid-stream (codec/parameter changes are routine on IPTV).
 public final class AudioDecoder: @unchecked Sendable {
     public let events: AsyncStream<DecodeEvent>
     private let eventSink: AsyncStream<DecodeEvent>.Continuation
@@ -29,19 +35,37 @@ public final class AudioDecoder: @unchecked Sendable {
     private var swrSourceFormat: Int32 = -1
     private var swrSourceRate: Int32 = -1
     private var swrSourceChannels: Int32 = -1
+    private var outputLayout = AVChannelLayout()
     private var currentSerial: UInt64?
     private var consecutiveErrors = 0
 
     private let maxConsecutiveErrors = 100
+    private let maxOutputChannels: Int
+
+    /// Channel budget of the current output route. The renderer downstream
+    /// cannot correctly render more channels than the route carries, so
+    /// anything beyond this is downmixed in swresample.
+    public static func defaultMaxOutputChannels() -> Int {
+        #if canImport(UIKit)
+        return max(2, AVAudioSession.sharedInstance().maximumOutputNumberOfChannels)
+        #else
+        // No AVAudioSession on macOS; default output is overwhelmingly 2ch
+        // (built-in speakers, headphones). Pass an explicit limit for
+        // multichannel interfaces.
+        return 2
+        #endif
+    }
 
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
-        output: Channel<AudioFrame>
+        output: Channel<AudioFrame>,
+        maxOutputChannels: Int = AudioDecoder.defaultMaxOutputChannels()
     ) {
         self.parameters = parameters
         self.input = input
         self.output = output
+        self.maxOutputChannels = max(1, maxOutputChannels)
         var continuation: AsyncStream<DecodeEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
@@ -190,7 +214,7 @@ public final class AudioDecoder: @unchecked Sendable {
         guard let converted = av_frame_alloc() else { return }
         converted.pointee.sample_rate = source.pointee.sample_rate
         converted.pointee.format = AV_SAMPLE_FMT_FLT.rawValue
-        av_channel_layout_copy(&converted.pointee.ch_layout, &source.pointee.ch_layout)
+        av_channel_layout_copy(&converted.pointee.ch_layout, &outputLayout)
         // swr may buffer; size output generously.
         converted.pointee.nb_samples = source.pointee.nb_samples + 256
 
@@ -233,11 +257,27 @@ public final class AudioDecoder: @unchecked Sendable {
         }
 
         swr_free(&swrContext)
+        // swr needs concrete layouts on both sides to build a (down)mix
+        // matrix; sources reporting an unspecified order (routine for PCM)
+        // are assumed to follow FFmpeg's default order for their count.
+        var inputLayout = AVChannelLayout()
+        if frame.pointee.ch_layout.order == AV_CHANNEL_ORDER_NATIVE {
+            av_channel_layout_copy(&inputLayout, &frame.pointee.ch_layout)
+        } else {
+            av_channel_layout_default(&inputLayout, channels)
+        }
+        defer { av_channel_layout_uninit(&inputLayout) }
+        av_channel_layout_uninit(&outputLayout)
+        if channels > Int32(maxOutputChannels) {
+            av_channel_layout_default(&outputLayout, Int32(maxOutputChannels))
+        } else {
+            av_channel_layout_copy(&outputLayout, &inputLayout)
+        }
         var newContext: OpaquePointer?
         let result = swr_alloc_set_opts2(
             &newContext,
-            &frame.pointee.ch_layout, AV_SAMPLE_FMT_FLT, rate,
-            &frame.pointee.ch_layout, AVSampleFormat(rawValue: format), rate,
+            &outputLayout, AV_SAMPLE_FMT_FLT, rate,
+            &inputLayout, AVSampleFormat(rawValue: format), rate,
             0, nil
         )
         guard result >= 0, let created = newContext, swr_init(created) >= 0 else {
@@ -297,6 +337,7 @@ public final class AudioDecoder: @unchecked Sendable {
     private func finishThread() {
         avcodec_free_context(&codecContext)
         swr_free(&swrContext)
+        av_channel_layout_uninit(&outputLayout)
         output.close()
         lock.lock()
         finished = true

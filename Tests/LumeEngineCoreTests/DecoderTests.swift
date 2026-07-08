@@ -1,3 +1,4 @@
+import CoreMedia
 import CoreVideo
 import Foundation
 import Testing
@@ -165,6 +166,52 @@ struct DecoderTests {
         #expect(abs(seconds - 10.0) < 0.3, "expected ~10 s of audio, got \(seconds)")
         #expect(zip(ptsValues, ptsValues.dropFirst()).allSatisfy { $0 < $1 }, "audio PTS must be monotonic")
         #expect(peak > 0.1, "a sine wave must have non-silent samples (peak \(peak))")
+    }
+
+    @Test("audio: 7.1 channel layout survives into the CMSampleBuffer", .timeLimit(.minutes(1)))
+    func audioMultichannelLayout() async throws {
+        var (demuxer, info, demuxEvents) = try await open("surround71.mkv")
+        defer { demuxer.shutdown() }
+
+        let track = try #require(info.audioTracks.first)
+        let parameters = try #require(demuxer.codecParameters(forStream: track.index))
+
+        let packets = Channel<Packet>(capacity: 128)
+        let frames = Channel<AudioFrame>(capacity: 64, measure: { $0.duration })
+        demuxer.attach(channel: packets, toStream: track.index)
+
+        let decoder = AudioDecoder(
+            parameters: parameters, input: packets, output: frames,
+            maxOutputChannels: 8 // multichannel-capable route
+        )
+        decoder.start()
+        demuxer.resume()
+
+        let frame = try #require(frames.receive(timeout: 5))
+        defer { decoder.shutdown() }
+        _ = demuxEvents
+
+        #expect(frame.channels == 8)
+        // FL FR FC LFE BL BR SL SR — FFmpeg's native 7.1 mask.
+        #expect(frame.channelBitmap == 0x63F)
+        #expect(frame.samples.count == frame.sampleCount * 8)
+
+        var cache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
+        var timeline = AudioTimeline()
+        let sample = try SampleBufferBuilder.audio(
+            from: frame,
+            presentationTime: timeline.presentationTime(for: frame),
+            formatCache: &cache
+        )
+        let description = try #require(CMSampleBufferGetFormatDescription(sample))
+
+        let asbd = try #require(CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee)
+        #expect(asbd.mChannelsPerFrame == 8)
+
+        var layoutSize = 0
+        let layout = try #require(CMAudioFormatDescriptionGetChannelLayout(description, sizeOut: &layoutSize))
+        #expect(layout.pointee.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap)
+        #expect(layout.pointee.mChannelBitmap.rawValue == 0x63F)
     }
 
     @Test("seek mid-decode: only new-serial frames after flush", .timeLimit(.minutes(1)))
