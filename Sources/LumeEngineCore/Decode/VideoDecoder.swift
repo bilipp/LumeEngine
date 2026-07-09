@@ -93,6 +93,7 @@ public final class VideoDecoder: @unchecked Sendable {
         let thread = Thread { [self] in threadMain() }
         thread.name = "engine.lume.video-decoder"
         thread.stackSize = 1 << 21 // some codecs are stack-hungry
+        thread.qualityOfService = .userInteractive // data plane (see Demuxer.start)
         thread.start()
     }
 

@@ -64,9 +64,18 @@ public final class AudioDecoder: @unchecked Sendable {
     /// Channel budget of the current output route. The renderer downstream
     /// cannot correctly render more channels than the route carries, so
     /// anything beyond this is downmixed in swresample.
+    ///
+    /// This must be the *negotiated* output width, not the route's capability:
+    /// `maximumOutputNumberOfChannels` reports what the hardware could carry
+    /// (8 over HDMI), but multichannel LPCM only flows once the app activates
+    /// an audio session with a matching `preferredOutputNumberOfChannels`.
+    /// Feeding the renderer more channels than the session actually outputs
+    /// fails the renderer outright (silence, wedged pipeline) — configuring
+    /// the session for surround is the app's job (PLAN.md §2.1), the engine
+    /// just honors whatever was negotiated at session-creation time.
     public static func defaultMaxOutputChannels() -> Int {
         #if canImport(UIKit)
-        return max(2, AVAudioSession.sharedInstance().maximumOutputNumberOfChannels)
+        return max(2, AVAudioSession.sharedInstance().outputNumberOfChannels)
         #else
         // No AVAudioSession on macOS; default output is overwhelmingly 2ch
         // (built-in speakers, headphones). Pass an explicit limit for
@@ -108,6 +117,7 @@ public final class AudioDecoder: @unchecked Sendable {
         let thread = Thread { [self] in threadMain() }
         thread.name = "engine.lume.audio-decoder"
         thread.stackSize = 1 << 20
+        thread.qualityOfService = .userInteractive // data plane (see Demuxer.start)
         thread.start()
     }
 

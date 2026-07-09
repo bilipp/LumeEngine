@@ -18,8 +18,10 @@ public final class SystemRenderer: @unchecked Sendable {
     private let videoRenderer: AVSampleBufferVideoRenderer
     private let audioRenderer = AVSampleBufferAudioRenderer()
 
-    private let videoQueue = DispatchQueue(label: "engine.lume.render.video")
-    private let audioQueue = DispatchQueue(label: "engine.lume.render.audio")
+    // Data-plane queues: the pumps feed the renderers on a deadline — at
+    // default QoS they get descheduled on loaded devices (see Demuxer.start).
+    private let videoQueue = DispatchQueue(label: "engine.lume.render.video", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "engine.lume.render.audio", qos: .userInteractive)
 
     // Guarded by `lock`.
     private let lock = NSLock()
@@ -28,6 +30,8 @@ public final class SystemRenderer: @unchecked Sendable {
     private var acceptedSerial: UInt64 = 0
     private var lastEnqueuedVideoPTS = MediaTime.noTimestamp
     private var lastEnqueuedAudioPTS = MediaTime.noTimestamp
+    private var firstEnqueuedVideoPTS = MediaTime.noTimestamp
+    private var firstEnqueuedAudioPTS = MediaTime.noTimestamp
     private var videoPumpScheduled = false
     private var audioPumpScheduled = false
     private var stopped = false
@@ -37,6 +41,15 @@ public final class SystemRenderer: @unchecked Sendable {
     private var audioFormatCache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
     // Audio-queue-confined; serial changes re-anchor it after a seek flush.
     private var audioTimeline = AudioTimeline()
+
+    /// Fires (once per lane) when a renderer transitions to `.failed` — e.g.
+    /// an audio format the output route cannot render. A failed renderer
+    /// silently stops accepting data, which would otherwise wedge the pipeline
+    /// with no event (§3.3: silence is never a failure mode) — the session
+    /// must surface this as a typed failure. Set before `attach`.
+    public var onRenderFailure: (@Sendable (EngineError) -> Void)?
+    private var statusObservations: [NSKeyValueObservation] = []
+    private var reportedFailure = false
 
     public init(muted: Bool = false) {
         displayLayer = AVSampleBufferDisplayLayer()
@@ -58,16 +71,41 @@ public final class SystemRenderer: @unchecked Sendable {
         audioInput = audio
         lock.unlock()
 
+        var observations: [NSKeyValueObservation] = []
         if video != nil {
+            observations.append(videoRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
+                guard renderer.status == .failed else { return }
+                self?.reportRenderFailure(lane: "video", underlying: renderer.error)
+            })
             videoRenderer.requestMediaDataWhenReady(on: videoQueue) { [weak self] in
                 self?.pumpVideo()
             }
         }
         if audio != nil {
+            observations.append(audioRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
+                guard renderer.status == .failed else { return }
+                self?.reportRenderFailure(lane: "audio", underlying: renderer.error)
+            })
             audioRenderer.requestMediaDataWhenReady(on: audioQueue) { [weak self] in
                 self?.pumpAudio()
             }
         }
+        lock.lock()
+        statusObservations.append(contentsOf: observations)
+        lock.unlock()
+    }
+
+    private func reportRenderFailure(lane: String, underlying: Error?) {
+        lock.lock()
+        let alreadyReported = reportedFailure || stopped
+        reportedFailure = true
+        lock.unlock()
+        guard !alreadyReported else { return }
+        let detail = underlying.map { " — \($0.localizedDescription)" } ?? ""
+        onRenderFailure?(EngineError(
+            code: .renderFailed,
+            message: "\(lane) renderer failed\(detail)"
+        ))
     }
 
     // MARK: Transport
@@ -119,6 +157,8 @@ public final class SystemRenderer: @unchecked Sendable {
         acceptedSerial = serial
         lastEnqueuedVideoPTS = MediaTime.noTimestamp
         lastEnqueuedAudioPTS = MediaTime.noTimestamp
+        firstEnqueuedVideoPTS = MediaTime.noTimestamp
+        firstEnqueuedAudioPTS = MediaTime.noTimestamp
         lock.unlock()
 
         videoRenderer.flush()
@@ -133,10 +173,35 @@ public final class SystemRenderer: @unchecked Sendable {
         return (lastEnqueuedVideoPTS, lastEnqueuedAudioPTS)
     }
 
+    /// First enqueued PTS per lane since the last flush — where delivered
+    /// media actually starts. The session compares this against a seek target
+    /// to detect a demuxer that landed somewhere else entirely (e.g. matroska
+    /// falling back to the earliest cluster when its cues are unreachable
+    /// over non-range HTTP) and re-anchors the clock to ground truth.
+    public var enqueuedLowWaterMark: (video: Int64, audio: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (firstEnqueuedVideoPTS, firstEnqueuedAudioPTS)
+    }
+
+    /// Raw renderer health for diagnostics (status is
+    /// `AVQueuedSampleBufferRenderingStatus`: 0 unknown, 1 rendering, 2 failed).
+    public var rendererHealth: (videoStatus: Int, audioStatus: Int, videoError: String?, audioError: String?) {
+        (
+            videoRenderer.status.rawValue,
+            audioRenderer.status.rawValue,
+            videoRenderer.error?.localizedDescription,
+            audioRenderer.error?.localizedDescription
+        )
+    }
+
     public func shutdown() {
         lock.lock()
         stopped = true
+        let observations = statusObservations
+        statusObservations = []
         lock.unlock()
+        observations.forEach { $0.invalidate() }
         videoRenderer.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
         synchronizer.setRate(0, time: .zero)
@@ -168,6 +233,7 @@ public final class SystemRenderer: @unchecked Sendable {
                 videoRenderer.enqueue(sample)
                 lock.lock()
                 lastEnqueuedVideoPTS = frame.pts
+                if !MediaTime.isValid(firstEnqueuedVideoPTS) { firstEnqueuedVideoPTS = frame.pts }
                 lock.unlock()
             } catch {
                 continue // malformed frame: drop, keep the pump alive
@@ -198,6 +264,7 @@ public final class SystemRenderer: @unchecked Sendable {
                 audioRenderer.enqueue(sample)
                 lock.lock()
                 lastEnqueuedAudioPTS = frame.pts + frame.duration
+                if !MediaTime.isValid(firstEnqueuedAudioPTS) { firstEnqueuedAudioPTS = frame.pts }
                 lock.unlock()
             } catch {
                 continue

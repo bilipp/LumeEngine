@@ -86,6 +86,42 @@ struct DemuxerTests {
         #expect(demuxer.shutdown())
     }
 
+    @Test("missing packet durations are synthesized from PTS steps")
+    func durationSynthesis() async throws {
+        // TrueHD-in-matroska packets carry no durations; every downstream
+        // duration budget (read-ahead limits, buffer gates) would read a
+        // loaded queue as "0 seconds". The demuxer must synthesize them.
+        let demuxer = Demuxer(url: try Fixtures.path("truehd.mkv"))
+        var events = demuxer.events.makeAsyncIterator()
+        demuxer.start()
+
+        guard case .opened(let info)? = await nextEvent(&events) else {
+            Issue.record("expected .opened"); demuxer.shutdown(); return
+        }
+        let audioIndex = try #require(info.audioTracks.first?.index)
+        let channel = Channel<Packet>(capacity: 8192)
+        demuxer.attach(channel: channel, toStream: audioIndex)
+        demuxer.resume()
+
+        guard case .endOfStream? = await nextEvent(&events) else {
+            Issue.record("expected .endOfStream"); demuxer.shutdown(); return
+        }
+
+        var totalDuration: Int64 = 0
+        var count = 0
+        while let packet = channel.tryReceive() {
+            totalDuration += max(packet.duration, 0)
+            count += 1
+        }
+        #expect(count > 4000, "4 s of TrueHD is ~4800 access units, got \(count)")
+        // 4 s fixture: the summed synthesized durations must account for
+        // nearly all of it (the very first packet has no predecessor).
+        let seconds = MediaTime.seconds(totalDuration)
+        #expect(seconds > 3.5 && seconds < 4.5, "synthesized durations should sum to ~4 s, got \(seconds)")
+
+        #expect(demuxer.shutdown())
+    }
+
     @Test("MPEG-TS timestamps stay monotonic across the 33-bit wrap seam")
     func wraparound() async throws {
         let demuxer = Demuxer(url: try Fixtures.path("wrap.ts"))

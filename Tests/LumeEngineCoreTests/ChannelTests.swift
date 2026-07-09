@@ -102,6 +102,34 @@ struct ChannelTests {
         #expect(channel.stats.bufferedDuration == 0)
     }
 
+    @Test("duration budget caps fullness in media time, count as backstop")
+    func durationBudget() throws {
+        // Budget 1000 µs, generous count: three 400 µs elements exceed the
+        // budget, so the channel must report full and refuse a fourth.
+        let channel = Channel<Int64>(capacity: 100, durationBudget: 1_000, measure: { $0 })
+        for duration in [Int64(400), 400, 400] { try channel.send(duration) }
+        #expect(channel.stats.isFull)
+        #expect(!channel.trySend(400))
+        #expect(try channel.send(400, timeout: 0.05) == false)
+
+        // Draining below the budget reopens it.
+        _ = channel.receive(timeout: 1)
+        #expect(!channel.stats.isFull)
+        #expect(channel.trySend(400))
+
+        // Unmeasured (zero-duration) elements never trip the budget — the
+        // element count is the backstop.
+        let unmeasured = Channel<Int64>(capacity: 3, durationBudget: 1_000, measure: { _ in 0 })
+        for _ in 0..<3 { try unmeasured.send(0) }
+        #expect(unmeasured.stats.isFull)
+
+        // A single element beyond the budget is still accepted (a channel
+        // that can never hold one element would deadlock the pipeline).
+        let oversize = Channel<Int64>(capacity: 4, durationBudget: 100, measure: { $0 })
+        #expect(oversize.trySend(5_000))
+        #expect(oversize.stats.isFull)
+    }
+
     @Test("concurrent producer/consumer transfers everything exactly once")
     func stress() {
         let channel = Channel<Int>(capacity: 7)

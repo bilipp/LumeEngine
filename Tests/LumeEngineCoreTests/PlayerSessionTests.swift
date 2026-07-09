@@ -93,6 +93,25 @@ struct PlayerSessionTests {
         await session.shutdown()
     }
 
+    @Test("startPosition opens at the requested resume point", .timeLimit(.minutes(1)))
+    func startPosition() async throws {
+        // Resume positions must seek before the demuxer's first read (some
+        // IPTV providers kill a connection that seeks mid-stream), so the
+        // engine takes them via configuration, not open-then-seek.
+        var configuration = PlayerConfiguration()
+        configuration.muted = true
+        configuration.bufferTarget = 0.5
+        configuration.startPosition = 7.0
+        let session = PlayerSession(configuration: configuration)
+        _ = try await session.open(url: try Fixtures.path("basic.mp4"))
+        await session.play()
+        let playing = await eventually { await session.state == .playing }
+        #expect(playing, "session must reach .playing from a start position")
+        let position = await session.position
+        #expect(position > 6.0 && position < 9.5, "expected playback near 7 s, got \(position)")
+        await session.shutdown()
+    }
+
     @Test("playback reaches .ended at end of file", .timeLimit(.minutes(2)))
     func playsToEnd() async throws {
         let session = makeSession()

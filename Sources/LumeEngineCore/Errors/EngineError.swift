@@ -13,6 +13,10 @@ public struct EngineError: Error, Sendable, CustomStringConvertible, Equatable {
         case cancelled
         case unsupported
         case internalError
+        /// An `AVSampleBuffer*Renderer` reported `.failed` (e.g. a format the
+        /// output route cannot render). Fatal for the session: a failed
+        /// renderer stops accepting data permanently.
+        case renderFailed
     }
 
     public let code: Code

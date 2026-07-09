@@ -20,6 +20,23 @@ public struct PlayerConfiguration: Sendable {
     public var hardwareDecode: VideoDecoder.HardwarePolicy = .videoToolbox
     /// Seconds of decoded media to buffer before starting/resuming playback.
     public var bufferTarget: Double = 1.0
+    /// Seconds of *compressed* media the demuxer reads ahead per lane (packet
+    /// queues). This is the jitter absorber for network sources: decoded
+    /// queues are deliberately tiny (video frames retain pixel buffers), so
+    /// smoothing must come from cheap undecoded packets. Budgeted in media
+    /// time — packet-count limits are meaningless across codecs (256 TrueHD
+    /// packets are 0.2 s; 256 AC-3 packets are 8 s). IPTV providers deliver
+    /// in bursts separated by multi-second gaps; the read-ahead must span the
+    /// gaps (~100 MB of compressed 4K at the default — the price every
+    /// smooth player pays).
+    public var packetReadAhead: Double = 15.0
+    /// Initial playback position (seconds); the seek happens after open but
+    /// *before* the demuxer starts streaming, while the I/O layer is still at
+    /// the container header. Seeking an in-flight streaming connection is
+    /// exactly what some IPTV providers cannot survive (range request against
+    /// a consumed session → dead connection), so a resume position must not
+    /// be implemented as open-then-seek from the app.
+    public var startPosition: Double = 0
     /// Frame-channel capacities (video frames retain pixel buffers — keep small).
     public var videoQueueDepth = 8
     public var audioQueueDepth = 48
@@ -88,9 +105,13 @@ public actor PlayerSession {
     private var audioAtEOF = false
     private var lastError: EngineError?
     private var pendingSeekTarget: Int64?
+    /// Set when a seek completed and the landing position still needs to be
+    /// verified against the first actually-delivered frames.
+    private var seekLandingTarget: Int64?
 
     // Stall watchdog (PLAN.md §3.3 — silence is never an acceptable failure mode).
-    private var lastObservedPosition: Double = -1
+    /// Watchdog progress signal: playhead + buffered media (see `runStallWatchdog`).
+    private var lastObservedProgress: Double = -1
     private var lastProgressDate = Date.distantFuture
     private var lastStallKick: Date?
 
@@ -175,7 +196,7 @@ public actor PlayerSession {
 
         if let track = videoTrack,
            let parameters = demuxer.codecParameters(forStream: track.index) {
-            let packets = Channel<Packet>(capacity: 256, measure: { max($0.duration, 0) })
+            let packets = makeVideoPacketChannel()
             let frames = Channel<VideoFrame>(capacity: configuration.videoQueueDepth, measure: { max($0.duration, 0) })
             demuxer.attach(channel: packets, toStream: track.index)
             let decoder = VideoDecoder(parameters: parameters, input: packets, output: frames, policy: configuration.hardwareDecode)
@@ -193,7 +214,7 @@ public actor PlayerSession {
 
         if let track = audioTrack,
            let parameters = demuxer.codecParameters(forStream: track.index) {
-            let packets = Channel<Packet>(capacity: 256, measure: { max($0.duration, 0) })
+            let packets = makeAudioPacketChannel()
             let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
             demuxer.attach(channel: packets, toStream: track.index)
             let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
@@ -209,9 +230,22 @@ public actor PlayerSession {
             decoder.start()
         }
 
+        renderer.onRenderFailure = { [weak self] error in
+            guard let self else { return }
+            Task { await self.handleRenderFailure(error) }
+        }
         renderer.attach(video: videoFrames, audio: audioFrames)
         renderer.flush(acceptingSerial: 0)
         renderer.setRate(0, anchoredAt: startTimeline)
+        // A resume position seeks BEFORE the first read: the demux thread
+        // processes commands in order, so the seek runs while the I/O layer
+        // is still at the header (matching `ffplay -ss` / KSPlayer), not
+        // against a connection that already streamed megabytes of body.
+        if configuration.startPosition > 0, info.isSeekable {
+            let target = info.startTime + MediaTime.microseconds(configuration.startPosition)
+            pendingSeekTarget = target
+            demuxer.seek(to: target)
+        }
         demuxer.resume()
 
         monitorTask = Task {
@@ -261,6 +295,83 @@ public actor PlayerSession {
 
     public var mediaInfo: MediaInfo? { info }
 
+    /// One-line pipeline health snapshot for app-side diagnostics/logging:
+    /// where the playhead is, how full each stage is, and whether the
+    /// renderers are still healthy. Cheap to compute; poll at a low rate.
+    public struct Diagnostics: Sendable, CustomStringConvertible {
+        public let state: String
+        public let playheadSeconds: Double
+        public let videoQueue: (count: Int, seconds: Double)?
+        public let audioQueue: (count: Int, seconds: Double)?
+        /// Undecoded read-ahead per lane (packet queues).
+        public let videoPacketQueue: (count: Int, seconds: Double)?
+        public let audioPacketQueue: (count: Int, seconds: Double)?
+        public let videoLeadSeconds: Double
+        public let audioLeadSeconds: Double
+        /// First enqueued PTS per lane since the last flush (seconds; -1 when
+        /// nothing accepted yet) — shows where post-seek media actually landed.
+        public let videoFirstSeconds: Double
+        public let audioFirstSeconds: Double
+        public let rendererHealth: (videoStatus: Int, audioStatus: Int, videoError: String?, audioError: String?)
+        public let demuxAtEOF: Bool
+        /// Total compressed bytes demuxed — diff across heartbeats for the
+        /// effective delivery rate.
+        public let deliveredBytes: Int64
+
+        public var description: String {
+            func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
+                guard let queue else { return "off" }
+                return String(format: "%d/%.2fs+%.2fs@%.2f", queue.count, queue.seconds, lead, first)
+            }
+            func packets(_ queue: (count: Int, seconds: Double)?) -> String {
+                guard let queue else { return "off" }
+                return String(format: "%d/%.2fs", queue.count, queue.seconds)
+            }
+            var health = "v\(rendererHealth.videoStatus) a\(rendererHealth.audioStatus)"
+            if let error = rendererHealth.videoError { health += " vErr(\(error))" }
+            if let error = rendererHealth.audioError { health += " aErr(\(error))" }
+            return String(
+                format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB",
+                state, playheadSeconds,
+                lane(videoQueue, lead: videoLeadSeconds, first: videoFirstSeconds),
+                packets(videoPacketQueue),
+                lane(audioQueue, lead: audioLeadSeconds, first: audioFirstSeconds),
+                packets(audioPacketQueue),
+                health, demuxAtEOF ? "yes" : "no",
+                Double(deliveredBytes) / 1_048_576
+            )
+        }
+    }
+
+    public var diagnostics: Diagnostics {
+        let playhead = renderer.currentTime
+        let highWater = renderer.enqueuedHighWaterMark
+        let lowWater = renderer.enqueuedLowWaterMark
+        func lead(_ mark: Int64) -> Double {
+            guard MediaTime.isValid(mark), MediaTime.isValid(playhead), mark > playhead else { return 0 }
+            return MediaTime.seconds(mark - playhead)
+        }
+        func lane(_ channel: Channel<some Sendable>?) -> (count: Int, seconds: Double)? {
+            guard let stats = channel?.stats else { return nil }
+            return (stats.count, MediaTime.seconds(stats.bufferedDuration))
+        }
+        return Diagnostics(
+            state: String(describing: state),
+            playheadSeconds: MediaTime.isValid(playhead) ? MediaTime.seconds(playhead) : -1,
+            videoQueue: lane(videoFrames),
+            audioQueue: lane(audioFrames),
+            videoPacketQueue: lane(videoPackets),
+            audioPacketQueue: lane(audioPackets),
+            videoLeadSeconds: lead(highWater.video),
+            audioLeadSeconds: lead(highWater.audio),
+            videoFirstSeconds: MediaTime.isValid(lowWater.video) ? MediaTime.seconds(lowWater.video) : -1,
+            audioFirstSeconds: MediaTime.isValid(lowWater.audio) ? MediaTime.seconds(lowWater.audio) : -1,
+            rendererHealth: renderer.rendererHealth,
+            demuxAtEOF: demuxAtEOF,
+            deliveredBytes: demuxer?.deliveredBytes ?? 0
+        )
+    }
+
     // MARK: Seek
 
     /// Seeks to `position` seconds (media-relative). Flush order matters:
@@ -268,9 +379,19 @@ public actor PlayerSession {
     /// the renderer accepts only the new serial (PLAN.md §3.4).
     public func seek(to position: Double) {
         guard let demuxer, let info else { return }
+        guard info.isSeekable else {
+            // avformat "succeeds" on unseekable sources by landing at the
+            // earliest available point — worse than useless: the clock would
+            // anchor at the target while media arrives from somewhere else.
+            eventSink.yield(.error(EngineError(
+                code: .seekFailed, message: "source is not seekable"
+            )))
+            return
+        }
         let clamped = max(0, position)
         let target = info.startTime + MediaTime.microseconds(clamped)
         pendingSeekTarget = target
+        seekLandingTarget = nil
 
         videoPackets?.flush()
         audioPackets?.flush()
@@ -306,6 +427,26 @@ public actor PlayerSession {
 
     var activeDemuxer: Demuxer? { demuxer }
 
+    /// Packet channels are budgeted in media time (`packetReadAhead`); the
+    /// element counts are memory backstops for streams that report no packet
+    /// durations. Audio gets a high count because packets can be minuscule
+    /// (TrueHD: 40 samples ≈ 0.83 ms — 4 s needs ~4800 packets of ~100 bytes).
+    private func makeVideoPacketChannel() -> Channel<Packet> {
+        Channel<Packet>(
+            capacity: 512,
+            durationBudget: MediaTime.microseconds(configuration.packetReadAhead),
+            measure: { max($0.duration, 0) }
+        )
+    }
+
+    func makeAudioPacketChannel() -> Channel<Packet> {
+        Channel<Packet>(
+            capacity: 32_768,
+            durationBudget: MediaTime.microseconds(configuration.packetReadAhead),
+            measure: { max($0.duration, 0) }
+        )
+    }
+
     func replaceAudioLane(demuxer: Demuxer, trackIndex: Int32, parameters: CodecParameters) {
         if let old = selectedAudioTrackIndex {
             demuxer.detach(streamIndex: old)
@@ -313,7 +454,7 @@ public actor PlayerSession {
         audioDecoder?.shutdown(deadline: 2)
         audioPackets?.close()
 
-        let packets = Channel<Packet>(capacity: 256, measure: { max($0.duration, 0) })
+        let packets = makeAudioPacketChannel()
         let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
         demuxer.attach(channel: packets, toStream: trackIndex)
         let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
@@ -372,17 +513,34 @@ public actor PlayerSession {
             currentSerial = serial
             renderer.flush(acceptingSerial: serial)
             if let target = pendingSeekTarget {
-                renderer.setRate(shouldPlay ? targetRate : 0, anchoredAt: target)
+                // Anchor paused; evaluatePlayback raises the rate once the
+                // lanes are buffered, exactly like a cold start. Running the
+                // clock immediately lets it sprint ahead of any source that
+                // delivers at ≤ real time (4K remuxes over IPTV) — every
+                // frame then arrives pre-expired and playback never engages.
+                renderer.setRate(0, anchoredAt: target)
                 pendingSeekTarget = nil
+                seekLandingTarget = target // verified against delivered PTS
                 eventSink.yield(.didSeek(position: MediaTime.seconds(target - (info?.startTime ?? 0))))
             }
-            if state == .ended { state = shouldPlay ? .playing : .paused }
+            // The clock is now paused for re-buffering: a session that wants
+            // to play re-enters through .buffering (stale pre-seek frames can
+            // make the lanes look non-starved, which would strand .playing
+            // with a stopped renderer).
+            if shouldPlay {
+                state = .buffering
+            } else if state == .ended {
+                state = .paused
+            }
             evaluatePlayback()
 
         case .seekFailed(let error):
             pendingSeekTarget = nil
-            renderer.setRate(shouldPlay ? targetRate : 0)
+            // The pipeline was flushed for the seek; re-buffer before running
+            // the clock again (evaluatePlayback restores the rate when ready).
+            renderer.setRate(0)
             eventSink.yield(.error(error))
+            evaluatePlayback()
 
         case .endOfStream:
             demuxAtEOF = true
@@ -401,6 +559,18 @@ public actor PlayerSession {
         case .closed:
             break
         }
+    }
+
+    /// A renderer went `.failed` (it permanently stops accepting data — the
+    /// pipeline would wedge with a healthy-looking demux/decode chain and no
+    /// event). Fail the session with the typed reason; recovery policy
+    /// (engine fallback, retry) is the app's job.
+    private func handleRenderFailure(_ error: EngineError) {
+        guard state != .failed, state != .idle else { return }
+        lastError = error
+        state = .failed
+        renderer.setRate(0)
+        eventSink.yield(.error(error))
     }
 
     private func handleDecode(_ event: DecodeEvent, isVideo: Bool) {
@@ -424,14 +594,52 @@ public actor PlayerSession {
         while !Task.isCancelled {
             try? await Task.sleep(for: .milliseconds(200))
             if Task.isCancelled { return }
+            verifySeekLanding()
             evaluatePlayback()
             runStallWatchdog()
         }
     }
 
-    /// Ground truth is the playhead, not any state flag: if playback should be
-    /// progressing and the clock isn't moving, something upstream died — no
-    /// matter what the components claim (decode threads can die without an
+    /// A container seek can "succeed" while landing somewhere else entirely —
+    /// matroska falls back to the earliest cluster when its cues are
+    /// unreachable (end-of-file cues over non-range HTTP is the classic IPTV
+    /// case). The clock was anchored at the *requested* target, so all
+    /// delivered media would be hours late: video renders as a stuttering
+    /// slideshow, audio is dropped wholesale, and the pipeline never buffers.
+    /// Compare the first delivered post-seek PTS against the target and
+    /// re-anchor the clock to ground truth when they clearly disagree.
+    private func verifySeekLanding() {
+        guard let target = seekLandingTarget, pendingSeekTarget == nil else { return }
+        let lowWater = renderer.enqueuedLowWaterMark
+        var marks: [Int64] = []
+        if videoDecoder != nil, MediaTime.isValid(lowWater.video) { marks.append(lowWater.video) }
+        if audioDecoder != nil, MediaTime.isValid(lowWater.audio) { marks.append(lowWater.audio) }
+        // max, not min: a genuinely mis-landed seek moves *every* lane (they
+        // share the demux position), while a transient pre-landing sliver on
+        // one lane must not drag the estimate away from where data really is.
+        guard let landed = marks.max() else { return } // nothing delivered yet
+
+        seekLandingTarget = nil
+        // Backward slack covers a keyframe-backward landing (normal: the late
+        // frames snap playback to the target); anything further off means the
+        // demuxer did not honor the seek.
+        let backwardSlack = MediaTime.microseconds(30)
+        let forwardSlack = MediaTime.microseconds(5)
+        guard landed < target - backwardSlack || landed > target + forwardSlack else { return }
+
+        // Preserve the current transport state: re-anchoring corrects the
+        // timeline, it must not start or stop playback on its own.
+        renderer.setRate(renderer.rate, anchoredAt: landed)
+        eventSink.yield(.didSeek(position: MediaTime.seconds(landed - (info?.startTime ?? 0))))
+    }
+
+    /// Ground truth is progress, not any state flag: the signal is the
+    /// least-advanced lane's enqueued high-water mark plus the remaining
+    /// pipeline runway. It grows in every healthy mode — enqueues advance
+    /// while playing, media accumulates while buffering — and freezes exactly
+    /// when the source stopped delivering *or* one lane silently died (a dead
+    /// decode thread pins its lane's high-water mark even while packets pile
+    /// up and the clock keeps running; decode threads can die without an
     /// error, and buffering callbacks lie).
     private func runStallWatchdog() {
         let expectingProgress = shouldPlay
@@ -441,13 +649,22 @@ public actor PlayerSession {
 
         guard expectingProgress else {
             lastProgressDate = .distantFuture
-            lastObservedPosition = -1
+            lastObservedProgress = -1
             return
         }
 
         let current = position
-        if current != lastObservedPosition {
-            lastObservedPosition = current
+        let highWater = renderer.enqueuedHighWaterMark
+        var laneMarks: [Double] = []
+        if videoDecoder != nil, !videoAtEOF {
+            laneMarks.append(MediaTime.isValid(highWater.video) ? MediaTime.seconds(highWater.video) : 0)
+        }
+        if audioDecoder != nil, !audioAtEOF {
+            laneMarks.append(MediaTime.isValid(highWater.audio) ? MediaTime.seconds(highWater.audio) : 0)
+        }
+        let progress = (laneMarks.min() ?? 0) + pipelineSeconds
+        if progress > lastObservedProgress + 0.01 {
+            lastObservedProgress = progress
             lastProgressDate = Date()
             return
         }
@@ -480,7 +697,7 @@ public actor PlayerSession {
         guard state != .failed, state != .idle, state != .opening, info != nil else { return }
         guard pendingSeekTarget == nil else { return }
 
-        let buffered = bufferedSeconds
+        let pipeline = pipelineSeconds
         let eligibleLanes = (videoFrames != nil ? 1 : 0) + (audioFrames != nil ? 1 : 0)
         guard eligibleLanes > 0 else { return }
 
@@ -490,7 +707,7 @@ public actor PlayerSession {
 
         // End detection: everything drained and the clock passed the last
         // enqueued sample.
-        if allEOF, buffered <= 0.01 {
+        if allEOF, pipeline <= 0.01 {
             let highWater = renderer.enqueuedHighWaterMark
             let mark = max(highWater.video, highWater.audio)
             if !MediaTime.isValid(mark) || renderer.currentTime >= mark {
@@ -507,51 +724,106 @@ public actor PlayerSession {
 
         switch state {
         case .ready, .paused, .buffering:
-            // Start when the target is buffered, when every lane is as full as
-            // it can get (capacity < target), or when EOF means no more is coming.
-            if buffered >= configuration.bufferTarget || allLanesSaturated || allEOF || demuxAtEOF {
+            // Start when every lane is as buffered as it can usefully get,
+            // or when EOF means no more is coming.
+            if allLanesReady || allEOF || demuxAtEOF {
                 renderer.setRate(targetRate)
                 state = .playing
             } else if state != .buffering {
                 state = .buffering
             }
         case .playing:
-            // Starvation: queues empty and more data is expected → buffer.
-            if buffered <= 0.01, !demuxAtEOF {
+            // Starvation: the *entire pipeline* (decoded + packets) is dry and
+            // more data is expected → buffer. Judged on total runway, not the
+            // decoded queues alone: a transient decode dip refills in
+            // milliseconds, while a rebuffer pause costs a second or more.
+            if pipeline <= 0.01, !demuxAtEOF {
                 renderer.setRate(0)
                 state = .buffering
+            } else if renderer.rate == 0, shouldPlay {
+                // Reconcile: .playing with a stopped renderer must never
+                // persist (any path that pauses the clock without demoting
+                // the state would otherwise strand playback silently).
+                renderer.setRate(targetRate)
             }
         default:
             break
         }
     }
 
-    /// Decoded seconds waiting in the frame queues (per-lane minimum: playback
-    /// stalls on the emptiest lane).
-    private var bufferedSeconds: Double {
-        var lanes: [Double] = []
-        if let videoFrames {
-            lanes.append(MediaTime.seconds(videoFrames.stats.bufferedDuration))
-        }
-        if let audioFrames {
-            lanes.append(MediaTime.seconds(audioFrames.stats.bufferedDuration))
-        }
-        return lanes.min() ?? 0
+    private struct LaneDepth {
+        /// Decoded seconds ahead of the playhead: frame queue + renderer lead.
+        var buffered: Double
+        /// Total runway: `buffered` plus undecoded packets — the currency of
+        /// both gates. Start: a multi-second buffer target is only reachable
+        /// in compressed form (decoded queues are tiny by design). Starvation:
+        /// a transient decode dip with seconds of packets queued must not stop
+        /// the clock (decoders refill in milliseconds; a rebuffer pause is
+        /// orders of magnitude worse).
+        var pipeline: Double
+        /// Frame *and* packet queues at capacity — this lane physically
+        /// cannot buffer more; waiting longer is pointless.
+        var queueFull: Bool
     }
 
-    /// True when every active lane's frame queue is at capacity — waiting any
-    /// longer cannot buffer more (queue capacity may be below the time target).
-    private var allLanesSaturated: Bool {
-        var saturated = true
-        var lanes = 0
-        if let videoFrames {
-            lanes += 1
-            saturated = saturated && videoFrames.stats.isFull
+    /// Per-lane decoded media ahead of the playhead. Counts both the frame
+    /// queue and what is already enqueued in the renderer but not yet played —
+    /// the pumps drain the queues into the renderers (whose appetite spans
+    /// seconds), so queue depth alone reads near-zero on a healthy consuming
+    /// lane and the state would flap or report `.buffering` long after
+    /// playback actually started (a post-seek warm start runs the renderer
+    /// while still `.buffering`). Lanes whose decoder hit EOF are excluded:
+    /// nothing more is coming, so they must not gate decisions.
+    private var laneDepths: [LaneDepth] {
+        let playhead = renderer.currentTime
+        let highWater = renderer.enqueuedHighWaterMark
+        func rendererLead(_ mark: Int64) -> Double {
+            guard MediaTime.isValid(mark), MediaTime.isValid(playhead), mark > playhead else { return 0 }
+            return MediaTime.seconds(mark - playhead)
         }
-        if let audioFrames {
-            lanes += 1
-            saturated = saturated && audioFrames.stats.isFull
+        var lanes: [LaneDepth] = []
+        if let videoFrames, !videoAtEOF {
+            let frameStats = videoFrames.stats
+            let packetStats = videoPackets?.stats
+            let buffered = MediaTime.seconds(frameStats.bufferedDuration) + rendererLead(highWater.video)
+            lanes.append(LaneDepth(
+                buffered: buffered,
+                pipeline: buffered + MediaTime.seconds(packetStats?.bufferedDuration ?? 0),
+                queueFull: frameStats.isFull && (packetStats?.isFull ?? true)
+            ))
         }
-        return lanes > 0 && saturated
+        if let audioFrames, !audioAtEOF {
+            let frameStats = audioFrames.stats
+            let packetStats = audioPackets?.stats
+            let buffered = MediaTime.seconds(frameStats.bufferedDuration) + rendererLead(highWater.audio)
+            lanes.append(LaneDepth(
+                buffered: buffered,
+                pipeline: buffered + MediaTime.seconds(packetStats?.bufferedDuration ?? 0),
+                queueFull: frameStats.isFull && (packetStats?.isFull ?? true)
+            ))
+        }
+        return lanes
+    }
+
+    /// Renderable media on the emptiest lane (start gate).
+    private var bufferedSeconds: Double {
+        laneDepths.map(\.buffered).min() ?? 0
+    }
+
+    /// Total runway on the emptiest lane (starvation and stall detection).
+    private var pipelineSeconds: Double {
+        laneDepths.map(\.pipeline).min() ?? 0
+    }
+
+    /// Start gate: every active lane either holds the buffer target across
+    /// its whole pipeline (packets count — decoded queues are tiny by design,
+    /// so a multi-second target is only reachable in compressed form) or
+    /// physically cannot buffer more anywhere. Judged per lane — requiring
+    /// every queue full at the same instant is a race a consuming lane loses.
+    private var allLanesReady: Bool {
+        let lanes = laneDepths
+        return !lanes.isEmpty && lanes.allSatisfy {
+            $0.pipeline >= configuration.bufferTarget || $0.queueFull
+        }
     }
 }

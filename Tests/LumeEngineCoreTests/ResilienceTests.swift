@@ -41,6 +41,69 @@ struct ResilienceTests {
         await session.shutdown()
     }
 
+    @Test("resume-style seek over a range-less HTTP server keeps playing", .timeLimit(.minutes(1)))
+    func seekOverRangelessHTTP() async throws {
+        // Matroska cues live at end-of-file and this server ignores Range
+        // requests (a routine IPTV-provider defect), so a seek right after
+        // open cannot use the index — FFmpeg lands wherever it can. Two engine
+        // guarantees are exercised: the seek command must preempt pipeline
+        // backpressure (a demuxer parked in a full channel's send() once
+        // deadlocked the whole session, watchdog disabled), and a landing
+        // that disagrees with the target must be re-anchored to the delivered
+        // PTS instead of running the clock where no media exists (silent
+        // stuttering wedge). Wherever FFmpeg lands, playback must be running
+        // and the clock advancing shortly after the seek.
+        let server = try TortureHTTPServer(mode: .file(Fixtures.url("seekcues.mkv")))
+        defer { server.stop() }
+
+        var configuration = makeConfiguration()
+        // Small read-ahead: this server's post-seek connection dies at its
+        // end, and a large read-ahead would surface that I/O error during
+        // initial buffering — this test is about seek dispatch and landing
+        // recovery, not read-ahead policy.
+        configuration.packetReadAhead = 2
+        let session = PlayerSession(configuration: configuration)
+        _ = try await session.open(url: server.url)
+        // Resume flow: seek straight after open, like an app restoring the
+        // last playback position before play().
+        await session.seek(to: 45)
+        await session.play()
+
+        let playing = await eventually(timeout: 15) { await session.state == .playing }
+        #expect(playing, "playback must start after the seek (no pipeline deadlock)")
+        let p1 = await session.position
+        try await Task.sleep(for: .seconds(2))
+        let p2 = await session.position
+        #expect(p2 > p1 + 1.0, "clock must advance after the seek, got \(p1) → \(p2)")
+        await session.shutdown()
+    }
+
+    @Test("surplus delivery accumulates into the packet read-ahead", .timeLimit(.minutes(1)))
+    func readAheadAccumulation() async throws {
+        // seekcues.mkv: 5.4 MB / 60 s ≈ 90 KB/s. Served at ~1.4× (126 KB/s),
+        // the pipeline must bank the ~0.4× surplus into the packet queues
+        // while playing — that accumulated runway is what absorbs the
+        // delivery gaps of bursty IPTV sources.
+        let server = try TortureHTTPServer(mode: .throttled(file: Fixtures.url("seekcues.mkv"), bytesPerSecond: 126_000))
+        defer { server.stop() }
+
+        let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 30))
+        _ = try await session.open(url: server.url)
+        await session.play()
+        let playing = await eventually { await session.state == .playing }
+        #expect(playing, "throttled-but-sufficient delivery must start playback")
+
+        try await Task.sleep(for: .seconds(12))
+        let diagnostics = await session.diagnostics
+        let videoRunway = (diagnostics.videoQueue?.seconds ?? 0) + (diagnostics.videoPacketQueue?.seconds ?? 0)
+        let audioRunway = (diagnostics.audioQueue?.seconds ?? 0) + (diagnostics.audioPacketQueue?.seconds ?? 0)
+        #expect(videoRunway > 2.5, "video pipeline must accumulate surplus, got \(videoRunway)s")
+        #expect(audioRunway > 2.5, "audio pipeline must accumulate surplus, got \(audioRunway)s")
+        #expect(await session.state == .playing, "playback must continue while accumulating")
+        await session.shutdown()
+    }
+
+
     @Test("403 fails fast with a typed error, no hang", .timeLimit(.minutes(1)))
     func forbidden() async throws {
         let server = try TortureHTTPServer(mode: .forbidden)

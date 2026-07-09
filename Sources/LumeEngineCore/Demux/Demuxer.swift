@@ -60,6 +60,21 @@ public final class Demuxer: @unchecked Sendable {
     private var serial: UInt64 = 0
     private var atEOF = false
     private var consecutiveErrors = 0
+    /// Packet whose bounded send timed out; retried after the next command drain.
+    private var pendingSend: (packet: Packet, channel: Channel<Packet>)?
+    /// Previous packet PTS per stream, for synthesizing missing durations
+    /// (reader-thread-only; reset on seek).
+    private var lastPTSByStream: [Int32: Int64] = [:]
+    // Guarded by `lock`: total compressed payload read (delivery-rate diagnostics).
+    private var bytesDelivered: Int64 = 0
+
+    /// Total compressed bytes demuxed so far — diff over time for the
+    /// effective network delivery rate.
+    public var deliveredBytes: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return bytesDelivered
+    }
 
     /// Consecutive `av_read_frame` failures tolerated before declaring the
     /// source dead (PLAN.md §3.3 — a corrupt stream must fail loudly, not hang).
@@ -95,6 +110,11 @@ public final class Demuxer: @unchecked Sendable {
         let thread = Thread { [self] in threadMain() }
         thread.name = "engine.lume.demuxer"
         thread.stackSize = 1 << 20
+        // Data-plane threads are latency-critical: at default QoS they get
+        // descheduled on loaded devices (4K decode saturating the cores) —
+        // the read cadence slows, TCP's window collapses, and network
+        // throughput measurably drops below the stream's bitrate.
+        thread.qualityOfService = .userInteractive
         thread.start()
     }
 
@@ -210,6 +230,7 @@ public final class Demuxer: @unchecked Sendable {
                 reading = true
                 atEOF = false
             case .seek(let target):
+                pendingSend = nil // pre-seek packet; downstream drops its serial anyway
                 performSeek(to: target)
                 atEOF = false
                 reading = true
@@ -219,9 +240,17 @@ public final class Demuxer: @unchecked Sendable {
                 break
             }
 
-            // 2. Read one packet.
+            // 2. Deliver, then read. Sends are *bounded*: a producer parked
+            // indefinitely under backpressure is deaf to commands, and a seek
+            // command that cannot preempt a full pipeline deadlocks the
+            // session (rate 0 + sated renderers = nothing ever drains).
             if reading && !atEOF {
-                readOnePacket(reading: &reading)
+                if let pending = pendingSend {
+                    pendingSend = nil
+                    deliver(pending.packet, to: pending.channel)
+                } else {
+                    readOnePacket(reading: &reading)
+                }
             } else if atEOF {
                 // Park until next command.
                 lock.lock()
@@ -331,6 +360,7 @@ public final class Demuxer: @unchecked Sendable {
         for key in normalizers.keys {
             normalizers[key]?.discontinuity()
         }
+        lastPTSByStream.removeAll()
         consecutiveErrors = 0
         eventSink.yield(.didSeek(to: target, serial: serial))
     }
@@ -367,6 +397,7 @@ public final class Demuxer: @unchecked Sendable {
         let streamIndex = rawPacket.pointee.stream_index
         lock.lock()
         let channel = outputs[streamIndex]
+        bytesDelivered += Int64(rawPacket.pointee.size)
         lock.unlock()
 
         guard let channel, let timeBase = timeBases[streamIndex] else {
@@ -382,7 +413,20 @@ public final class Demuxer: @unchecked Sendable {
 
         let pts = MediaTime.fromStream(unwrappedPts, timeBase: timeBase)
         let dts = MediaTime.fromStream(unwrappedDts, timeBase: timeBase)
-        let duration = MediaTime.fromStream(rawPacket.pointee.duration, timeBase: timeBase)
+        var duration = MediaTime.fromStream(rawPacket.pointee.duration, timeBase: timeBase)
+
+        // Containers routinely omit packet durations (matroska TrueHD tracks
+        // without a default duration). All duration-budgeted accounting
+        // downstream — read-ahead limits, buffer gates, stats — would read a
+        // fully loaded queue as "0 seconds", so synthesize from the PTS step
+        // to the previous packet of the same stream (capped: a step across a
+        // gap is not a duration).
+        if duration <= 0, MediaTime.isValid(pts) {
+            if let previous = lastPTSByStream[streamIndex], pts > previous {
+                duration = min(pts - previous, 1_000_000)
+            }
+        }
+        if MediaTime.isValid(pts) { lastPTSByStream[streamIndex] = pts }
 
         // Rewrite the raw packet to engine time. Decoders set
         // `pkt_timebase = AV_TIME_BASE_Q`, so decoded frames come out already
@@ -400,9 +444,18 @@ public final class Demuxer: @unchecked Sendable {
             serial: serial
         )
 
-        // Blocking send = backpressure. A closed channel (teardown/track switch
-        // mid-flight) just drops the packet and keeps the loop responsive.
-        try? channel.send(packet)
+        deliver(packet, to: channel)
+    }
+
+    /// Bounded send = backpressure that stays command-responsive: when the
+    /// channel is still full after the timeout, the packet is parked in
+    /// `pendingSend` and the main loop retries after draining commands. A
+    /// closed channel (teardown/track switch mid-flight) just drops the
+    /// packet and keeps the loop responsive.
+    private func deliver(_ packet: Packet, to channel: Channel<Packet>) {
+        if let sent = try? channel.send(packet, timeout: 0.1), !sent {
+            pendingSend = (packet, channel)
+        }
     }
 
     private func closeInput() {
