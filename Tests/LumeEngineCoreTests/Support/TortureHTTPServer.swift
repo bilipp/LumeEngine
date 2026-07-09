@@ -14,6 +14,9 @@ final class TortureHTTPServer: @unchecked Sendable {
         case stallAfter(prefix: Int, file: URL)
         /// Send headers + prefix, then hard-close (mid-stream drop).
         case dropAfter(prefix: Int, file: URL)
+        /// Serve the file paced at `bytesPerSecond` (rate-limited IPTV
+        /// provider): 100 ms chunks with sleeps in between.
+        case throttled(file: URL, bytesPerSecond: Int)
     }
 
     private let listener: NWListener
@@ -131,7 +134,29 @@ final class TortureHTTPServer: @unchecked Sendable {
             connection.send(content: headers + body, completion: .contentProcessed { _ in
                 connection.forceCancel()
             })
+
+        case .throttled(let url, let bytesPerSecond):
+            guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
+            let chunk = max(1, bytesPerSecond / 10)
+            connection.send(content: header(totalLength: payload.count), completion: .contentProcessed { [weak self] _ in
+                self?.sendPaced(payload: payload, offset: 0, chunk: chunk, on: connection)
+            })
         }
+    }
+
+    private func sendPaced(payload: Data, offset: Int, chunk: Int, on connection: NWConnection) {
+        guard offset < payload.count else {
+            connection.cancel()
+            return
+        }
+        let end = min(offset + chunk, payload.count)
+        let slice = payload.subdata(in: offset..<end)
+        connection.send(content: slice, completion: .contentProcessed { [weak self] error in
+            guard error == nil, let self else { return connection.cancel() }
+            self.queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                self.sendPaced(payload: payload, offset: end, chunk: chunk, on: connection)
+            }
+        })
     }
 
     private func header(totalLength: Int) -> Data {

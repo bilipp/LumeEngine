@@ -42,6 +42,15 @@ gen surround71.mkv \
     -af "aformat=channel_layouts=7.1" \
     -c:a flac
 
+# 60 s MKV: matroska writes its cues at end-of-file, so over an HTTP server
+# that ignores Range requests every seek falls back to the earliest cluster —
+# the session must re-anchor to the delivered position instead of wedging.
+gen seekcues.mkv \
+    -f lavfi -i "testsrc2=duration=60:size=320x180:rate=25" \
+    -f lavfi -i "sine=frequency=440:duration=60" \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 50 \
+    -c:a aac -shortest -f matroska
+
 # TrueHD decodes to 40-sample access units (0.83 ms at 48 kHz, 1200 frames/s) —
 # the extreme small-frame case the audio decoder must coalesce, or downstream
 # frame queues hold almost no audio. Encoder is experimental, hence -strict -2.

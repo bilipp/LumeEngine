@@ -1,5 +1,9 @@
-import LumeEngine
 import SwiftUI
+
+// The demo is a macOS-only tool; the package's library products build for
+// every platform and the demo must not block them (CI/simulator test runs).
+#if os(macOS)
+import LumeEngine
 
 /// Minimal engine demo (macOS): URL bar, transport controls, diagnostics HUD.
 /// Run with `swift run LumeEngineDemo` from the repo root.
@@ -109,3 +113,11 @@ struct DemoView: View {
         return fixture.path
     }
 }
+#else
+@main
+struct LumeEngineDemoApp {
+    static func main() {
+        fatalError("LumeEngineDemo is macOS-only")
+    }
+}
+#endif
