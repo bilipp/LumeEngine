@@ -78,7 +78,7 @@ extension PlayerSession {
             }
         }
         demuxer.shutdown() // closes the packet channel → decoder drains and stops
-        decoder.shutdown()
+        decoder.drainAndShutdown() // shutdown() would race the drain and drop trailing cues
         markExternalSubtitlesActive()
     }
 }

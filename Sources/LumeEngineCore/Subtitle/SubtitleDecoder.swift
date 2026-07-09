@@ -35,7 +35,33 @@ public final class SubtitleDecoder: @unchecked Sendable {
 
         let thread = Thread { [self] in threadMain() }
         thread.name = "engine.lume.subtitle-decoder"
+        thread.qualityOfService = .userInitiated // low rate, but must not lag the data plane
         thread.start()
+    }
+
+    /// Joins the decode thread after it drains the remaining queued packets
+    /// (the input channel must already be closed, or be closed here). Use when
+    /// every queued cue must still land in the store — `shutdown()` aborts
+    /// immediately, dropping whatever the thread hasn't consumed yet. Falls
+    /// back to a hard stop if draining exceeds `deadline`.
+    @discardableResult
+    public func drainAndShutdown(deadline: TimeInterval = 5.0) -> Bool {
+        input.close()
+        let limit = Date(timeIntervalSinceNow: deadline)
+        lock.lock()
+        if !started {
+            finished = true
+            lock.unlock()
+            return true
+        }
+        while !finished {
+            if !lock.wait(until: limit) {
+                lock.unlock()
+                return shutdown(deadline: deadline)
+            }
+        }
+        lock.unlock()
+        return true
     }
 
     @discardableResult
