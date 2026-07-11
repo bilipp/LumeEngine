@@ -45,6 +45,14 @@ public struct PlayerConfiguration: Sendable {
     public var muted = false
     /// Seconds without clock progress (while expected) before `.stalled` fires.
     public var stallThreshold: Double = 8
+    /// Zero-delay stream switching (PLAN.md §6), consumed by the `LumePlayer`
+    /// facade: `load(url:)` on an already-open player keeps the current
+    /// session rendering while the replacement opens through its first
+    /// decoded frame, then swaps the renderer attachment atomically (the old
+    /// session is torn down asynchronously). Also gates `prepare(next:)`
+    /// consumption. The switch briefly holds two source connections — turn
+    /// this off for providers that allow only one concurrent stream.
+    public var seamlessSwitching = true
 
     public init() {}
 }
@@ -78,7 +86,7 @@ public actor PlayerSession {
     /// `activeCues(at: renderer.currentTime)` from any thread.
     public nonisolated let subtitles = SubtitleStore()
 
-    private(set) var state: State = .idle {
+    public private(set) var state: State = .idle {
         didSet {
             if state != oldValue { eventSink.yield(.stateChanged(state)) }
         }
@@ -370,6 +378,35 @@ public actor PlayerSession {
             demuxAtEOF: demuxAtEOF,
             deliveredBytes: demuxer?.deliveredBytes ?? 0
         )
+    }
+
+    // MARK: Zero-delay switching support (PLAN.md §6)
+
+    /// Suspends until the renderer holds the first decoded frame of the
+    /// presentation lane — video when a video track is active, else audio.
+    /// The renderers accept media while the clock is paused, so a freshly
+    /// opened session reaches this point without ever playing: this is the
+    /// "prepared through first-frame-decoded" gate for zero-delay switching
+    /// (a standby session whose display layer already shows a picture can be
+    /// swapped in with no black gap).
+    ///
+    /// Returns `false` if the session fails, is torn down, or the timeout
+    /// elapses first — callers may still swap then; they just lose the
+    /// no-gap guarantee.
+    @discardableResult
+    public func waitForFirstFrame(timeout: Double = 10) async -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while Date() < deadline {
+            if state == .failed || state == .idle && info != nil { return false }
+            let lowWater = renderer.enqueuedLowWaterMark
+            if videoDecoder != nil {
+                if MediaTime.isValid(lowWater.video) { return true }
+            } else if audioDecoder != nil {
+                if MediaTime.isValid(lowWater.audio) { return true }
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return false
     }
 
     // MARK: Seek

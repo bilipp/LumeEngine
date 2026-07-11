@@ -49,6 +49,17 @@ public final class LumePlayer {
     private var tickTask: Task<Void, Never>?
     private let configuration: PlayerConfiguration
 
+    /// Standby session pre-opened by `prepare(next:)`, held through
+    /// first-frame-decoded until `load(url:)` consumes it.
+    private var preparedNext: (url: String, session: PlayerSession, info: MediaInfo)?
+    /// Supersession guards: a `load`/`prepare` that lost a race against a
+    /// newer call (or `stop`) discards its session instead of installing it.
+    private var loadGeneration: UInt64 = 0
+    private var prepareGeneration: UInt64 = 0
+    /// Bound on the first-frame wait during a seamless swap; past it the swap
+    /// proceeds anyway (losing only the no-gap guarantee).
+    private static let firstFrameTimeout: Double = 10
+
     public init(configuration: PlayerConfiguration = PlayerConfiguration()) {
         self.configuration = configuration
     }
@@ -57,13 +68,148 @@ public final class LumePlayer {
 
     /// Opens `url`, replacing any previous session (each open is a fresh
     /// engine session — PLAN.md §3.1).
+    ///
+    /// Zero-delay switching (PLAN.md §6, on by default via
+    /// `PlayerConfiguration.seamlessSwitching`): when a session matching
+    /// `url` was staged by `prepare(next:)`, the swap is immediate. Otherwise,
+    /// if something is already open, the current session keeps rendering
+    /// while the replacement opens through its first decoded frame, and only
+    /// then is the renderer attachment swapped — the old session tears down
+    /// asynchronously. If the seamless open fails (dead source, or a provider
+    /// that refuses a second concurrent connection), the old session is torn
+    /// down and one cold open is retried before the error surfaces.
     public func load(url: String) async throws -> MediaInfo {
+        loadGeneration &+= 1
+        let generation = loadGeneration
+
+        // A prepared session for this exact URL swaps in with no open cost.
+        if configuration.seamlessSwitching,
+           let prepared = preparedNext, prepared.url == url {
+            preparedNext = nil
+            if await prepared.session.state != .failed {
+                guard generation == loadGeneration else {
+                    Task { await prepared.session.shutdown() }
+                    throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+                }
+                adopt(session: prepared.session, info: prepared.info)
+                return prepared.info
+            }
+            // The standby died while waiting (network drop) — fall through.
+            let dead = prepared.session
+            Task { await dead.shutdown() }
+        }
+        discardPreparedSession()
+
+        if configuration.seamlessSwitching, session != nil, state != .failed {
+            let next = PlayerSession(configuration: configuration)
+            do {
+                let info = try await next.open(url: url)
+                await next.waitForFirstFrame(timeout: Self.firstFrameTimeout)
+                guard generation == loadGeneration else {
+                    Task { await next.shutdown() }
+                    throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+                }
+                adopt(session: next, info: info)
+                return info
+            } catch {
+                Task { await next.shutdown() }
+                guard generation == loadGeneration else { throw error }
+                // Cold retry with the old session gone: a provider capped at
+                // one concurrent connection refuses the overlapped open but
+                // accepts the same URL once the current stream is closed.
+            }
+        }
+
         await teardownSession()
+        guard generation == loadGeneration else {
+            throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+        }
 
         let session = PlayerSession(configuration: configuration)
         self.session = session
         state = .opening
+        startObservation(of: session)
 
+        do {
+            let info = try await session.open(url: url)
+            guard generation == loadGeneration else {
+                throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+            }
+            mediaInfo = info
+            duration = info.duration.map(MediaTime.seconds)
+            return info
+        } catch {
+            // A superseded load must not clobber the newer load's state.
+            guard generation == loadGeneration else { throw error }
+            lastError = error as? EngineError
+            state = .failed
+            throw error
+        }
+    }
+
+    /// Stages `url` in a standby session, opened through first-frame-decoded
+    /// but never played (PLAN.md §6). A following `load(url:)` for the same
+    /// URL swaps it in with zero delay — this powers next-episode
+    /// auto-advance and channel zapping. Current playback is untouched.
+    ///
+    /// Only one URL is staged at a time; a newer `prepare` replaces the
+    /// previous standby. The standby holds its own source connection and
+    /// read-ahead buffer until consumed or discarded.
+    @discardableResult
+    public func prepare(next url: String) async throws -> MediaInfo {
+        discardPreparedSession()
+        prepareGeneration &+= 1
+        let generation = prepareGeneration
+
+        let session = PlayerSession(configuration: configuration)
+        do {
+            let info = try await session.open(url: url)
+            await session.waitForFirstFrame(timeout: Self.firstFrameTimeout)
+            guard generation == prepareGeneration else {
+                Task { await session.shutdown() }
+                throw EngineError(code: .invalidState, message: "prepare superseded by a newer prepare")
+            }
+            preparedNext = (url, session, info)
+            return info
+        } catch {
+            Task { await session.shutdown() }
+            throw error
+        }
+    }
+
+    /// Discards the standby session staged by `prepare(next:)`, if any.
+    public func discardPreparedSession() {
+        prepareGeneration &+= 1
+        guard let prepared = preparedNext else { return }
+        preparedNext = nil
+        Task { await prepared.session.shutdown() }
+    }
+
+    /// Atomic swap of `prepare`d/seamlessly opened media: the new session
+    /// becomes the active one (its display layer replaces the old one via the
+    /// `displayLayer` observation) and the old session is torn down
+    /// asynchronously — the swap never waits for thread joins.
+    private func adopt(session next: PlayerSession, info: MediaInfo) {
+        eventTask?.cancel()
+        tickTask?.cancel()
+        if let old = session {
+            Task { await old.shutdown() }
+        }
+        session = next
+        state = .ready
+        mediaInfo = info
+        duration = info.duration.map(MediaTime.seconds)
+        lastError = nil
+        subtitleText = nil
+        startObservation(of: next)
+        if rate != 1.0 {
+            let rate = rate
+            Task { await next.setRate(rate) }
+        }
+    }
+
+    /// Event pump + 10 Hz position tick for the active session.
+    private func startObservation(of session: PlayerSession) {
         eventTask = Task { [events = session.events] in
             for await event in events {
                 self.handle(event: event)
@@ -74,17 +220,6 @@ public final class LumePlayer {
                 try? await Task.sleep(for: .milliseconds(100))
                 await self.tick()
             }
-        }
-
-        do {
-            let info = try await session.open(url: url)
-            mediaInfo = info
-            duration = info.duration.map(MediaTime.seconds)
-            return info
-        } catch {
-            lastError = error as? EngineError
-            state = .failed
-            throw error
         }
     }
 
@@ -127,6 +262,8 @@ public final class LumePlayer {
     }
 
     public func stop() async {
+        loadGeneration &+= 1
+        discardPreparedSession()
         await teardownSession()
         state = .idle
         position = 0
