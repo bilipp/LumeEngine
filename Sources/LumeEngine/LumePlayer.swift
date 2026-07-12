@@ -69,22 +69,23 @@ public final class LumePlayer {
     /// Opens `url`, replacing any previous session (each open is a fresh
     /// engine session — PLAN.md §3.1).
     ///
-    /// Zero-delay switching (PLAN.md §6, on by default via
-    /// `PlayerConfiguration.seamlessSwitching`): when a session matching
-    /// `url` was staged by `prepare(next:)`, the swap is immediate. Otherwise,
-    /// if something is already open, the current session keeps rendering
-    /// while the replacement opens through its first decoded frame, and only
-    /// then is the renderer attachment swapped — the old session tears down
-    /// asynchronously. If the seamless open fails (dead source, or a provider
-    /// that refuses a second concurrent connection), the old session is torn
-    /// down and one cold open is retried before the error surfaces.
+    /// Zero-delay switching (PLAN.md §6), governed by
+    /// `PlayerConfiguration.switchPolicy`: when a session matching `url` was
+    /// staged by `prepare(next:)`, the swap is immediate under any policy.
+    /// Otherwise `.overlapped` keeps the current session rendering while the
+    /// replacement opens through its first decoded frame (two connections
+    /// briefly), and `.sequential` closes the current session *first* —
+    /// freeing its source connection — while its last decoded frame stays
+    /// frozen on screen until the replacement is ready. A failed overlapped
+    /// open (e.g. a provider capped at one concurrent connection) falls back
+    /// to the sequential path before the error surfaces.
     public func load(url: String) async throws -> MediaInfo {
         loadGeneration &+= 1
         let generation = loadGeneration
 
-        // A prepared session for this exact URL swaps in with no open cost.
-        if configuration.seamlessSwitching,
-           let prepared = preparedNext, prepared.url == url {
+        // A prepared session for this exact URL swaps in with no open cost
+        // (consuming it opens nothing new), so it is honored under any policy.
+        if let prepared = preparedNext, prepared.url == url {
             preparedNext = nil
             if await prepared.session.state != .failed {
                 guard generation == loadGeneration else {
@@ -100,7 +101,8 @@ public final class LumePlayer {
         }
         discardPreparedSession()
 
-        if configuration.seamlessSwitching, session != nil, state != .failed {
+        let canSwitch = session != nil && state != .failed
+        if canSwitch, configuration.switchPolicy == .overlapped {
             let next = PlayerSession(configuration: configuration)
             do {
                 let info = try await next.open(url: url)
@@ -114,10 +116,13 @@ public final class LumePlayer {
             } catch {
                 Task { await next.shutdown() }
                 guard generation == loadGeneration else { throw error }
-                // Cold retry with the old session gone: a provider capped at
+                // Fall through to the sequential retry: a provider capped at
                 // one concurrent connection refuses the overlapped open but
                 // accepts the same URL once the current stream is closed.
             }
+        }
+        if canSwitch, configuration.switchPolicy != .none {
+            return try await sequentialLoad(url: url, generation: generation)
         }
 
         await teardownSession()
@@ -147,14 +152,57 @@ public final class LumePlayer {
         }
     }
 
+    /// Single-connection switch: the current session shuts down first (its
+    /// display layer keeps the last decoded frame — `SystemRenderer.shutdown`
+    /// flushes without removing the displayed image, so the screen never
+    /// blanks), then the replacement opens and the layers swap at its first
+    /// frame. At most one source connection exists at any moment. Playback
+    /// pauses for the duration of the open — the price of the connection cap.
+    private func sequentialLoad(url: String, generation: UInt64) async throws -> MediaInfo {
+        eventTask?.cancel()
+        tickTask?.cancel()
+        if let old = session {
+            // Bounded join: the connection must actually be closed before the
+            // replacement opens, or a one-connection provider refuses it.
+            await old.shutdown()
+        }
+        state = .opening
+        guard generation == loadGeneration else {
+            throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+        }
+
+        let next = PlayerSession(configuration: configuration)
+        do {
+            let info = try await next.open(url: url)
+            await next.waitForFirstFrame(timeout: Self.firstFrameTimeout)
+            guard generation == loadGeneration else {
+                Task { await next.shutdown() }
+                throw EngineError(code: .invalidState, message: "load superseded by a newer load")
+            }
+            adopt(session: next, info: info)
+            return info
+        } catch {
+            Task { await next.shutdown() }
+            guard generation == loadGeneration else { throw error }
+            // The dead session stays attached: its frozen frame keeps the
+            // surface alive behind whatever failure UI the app raises.
+            lastError = error as? EngineError
+            state = .failed
+            throw error
+        }
+    }
+
     /// Stages `url` in a standby session, opened through first-frame-decoded
     /// but never played (PLAN.md §6). A following `load(url:)` for the same
     /// URL swaps it in with zero delay — this powers next-episode
     /// auto-advance and channel zapping. Current playback is untouched.
     ///
     /// Only one URL is staged at a time; a newer `prepare` replaces the
-    /// previous standby. The standby holds its own source connection and
-    /// read-ahead buffer until consumed or discarded.
+    /// previous standby. The standby holds its **own source connection** and
+    /// read-ahead buffer until consumed or discarded — only call this when
+    /// the source allows a stream beside the playing one (the same budget as
+    /// `SwitchPolicy.overlapped`); on one-connection providers rely on the
+    /// sequential switch instead.
     @discardableResult
     public func prepare(next url: String) async throws -> MediaInfo {
         discardPreparedSession()

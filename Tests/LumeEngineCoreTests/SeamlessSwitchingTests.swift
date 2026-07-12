@@ -113,11 +113,59 @@ struct SeamlessSwitchingTests {
         await player.stop()
     }
 
-    @Test("seamlessSwitching off restores the cold teardown-first path", .timeLimit(.minutes(1)))
+    @Test("sequential policy switches on one connection at a time", .timeLimit(.minutes(1)))
+    @MainActor
+    func sequentialSwitch() async throws {
+        var configuration = makeConfiguration()
+        configuration.switchPolicy = .sequential
+        let player = LumePlayer(configuration: configuration)
+
+        _ = try await player.load(url: try Fixtures.path("basic.mp4"))
+        let firstLayer = player.displayLayer
+        player.play()
+        try await eventually(player, reaches: .playing)
+
+        // The old session closes before the new one opens (one connection);
+        // the surface swaps only once the replacement holds its first frame.
+        let info = try await player.load(url: try Fixtures.path("multitrack.mkv"))
+        #expect(info.audioTracks.count == 2)
+        #expect(player.displayLayer !== firstLayer)
+
+        player.play()
+        try await eventually(player, reaches: .playing)
+        #expect(player.position < 9, "position must belong to the new session")
+
+        await player.stop()
+    }
+
+    @Test("sequential load of a dead source keeps the frozen surface and fails", .timeLimit(.minutes(1)))
+    @MainActor
+    func sequentialLoadFailure() async throws {
+        var configuration = makeConfiguration()
+        configuration.switchPolicy = .sequential
+        let player = LumePlayer(configuration: configuration)
+
+        _ = try await player.load(url: try Fixtures.path("basic.mp4"))
+        let firstLayer = player.displayLayer
+        player.play()
+        try await eventually(player, reaches: .playing)
+
+        await #expect(throws: EngineError.self) {
+            _ = try await player.load(url: "/nonexistent/definitely-missing.mp4")
+        }
+        try await eventually(player, reaches: .failed)
+        // The dead session stays attached so its last frame keeps the surface
+        // alive behind the app's failure UI.
+        #expect(player.displayLayer === firstLayer)
+
+        await player.stop()
+    }
+
+    @Test("switchPolicy .none restores the cold teardown-first path", .timeLimit(.minutes(1)))
     @MainActor
     func coldSwitchWhenDisabled() async throws {
         var configuration = makeConfiguration()
-        configuration.seamlessSwitching = false
+        configuration.switchPolicy = .none
         let player = LumePlayer(configuration: configuration)
 
         _ = try await player.load(url: try Fixtures.path("basic.mp4"))

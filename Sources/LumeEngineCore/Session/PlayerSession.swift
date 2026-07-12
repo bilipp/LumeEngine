@@ -45,14 +45,28 @@ public struct PlayerConfiguration: Sendable {
     public var muted = false
     /// Seconds without clock progress (while expected) before `.stalled` fires.
     public var stallThreshold: Double = 8
-    /// Zero-delay stream switching (PLAN.md §6), consumed by the `LumePlayer`
-    /// facade: `load(url:)` on an already-open player keeps the current
-    /// session rendering while the replacement opens through its first
-    /// decoded frame, then swaps the renderer attachment atomically (the old
-    /// session is torn down asynchronously). Also gates `prepare(next:)`
-    /// consumption. The switch briefly holds two source connections — turn
-    /// this off for providers that allow only one concurrent stream.
-    public var seamlessSwitching = true
+
+    /// How `LumePlayer.load(url:)` replaces an already-open source
+    /// (zero-delay switching, PLAN.md §6).
+    public enum SwitchPolicy: Sendable, Equatable {
+        /// Zero-delay: the replacement opens behind the still-playing session
+        /// and swaps in once it holds its first decoded frame. Briefly holds
+        /// **two** source connections — use only when the source allows a
+        /// second concurrent stream (a refused overlapped open falls back to
+        /// `.sequential` automatically).
+        case overlapped
+        /// Single-connection zero-black: the current session closes *first*
+        /// (releasing its connection), its last decoded frame stays frozen on
+        /// screen while the replacement opens, and the layers swap at first
+        /// frame. Playback pauses during the switch but the screen never
+        /// blanks. The safe choice for providers capped at one connection.
+        case sequential
+        /// Teardown-first with a blank surface (no switching aid).
+        case none
+    }
+
+    /// Switch behavior for `LumePlayer.load(url:)`; see `SwitchPolicy`.
+    public var switchPolicy: SwitchPolicy = .overlapped
 
     public init() {}
 }
