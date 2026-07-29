@@ -180,10 +180,10 @@ Modeled on mpvkit/ffmpeg-build's approach but owned by us, under `build/`:
 - **Pinned versions manifest** (`build/versions.json`): ffmpeg 8.1.2, dav1d, libass + freetype + harfbuzz + fribidi + libunibreak, (later: libbluray, libdvdread/nav; whisper.cpp ships as a separate SPM dep).
 - **Config: LGPL** — `--disable-gpl --disable-nonfree --disable-programs --disable-doc --disable-encoders --disable-muxers` (keep a whitelist for HLS/TS demux side), `--enable-videotoolbox --enable-audiotoolbox --enable-securetransport --enable-libdav1d --enable-network`, full decoder/demuxer/protocol set otherwise. Size budget tracked per platform (~25–35 MB/slice expected).
 - **Targets**: iOS arm64 + sim (arm64), tvOS arm64 + sim, macOS arm64 + x86_64, visionOS arm64 + sim. Static libs → per-library **xcframeworks** with clean bundle identifiers and deep macOS layout (App Store-validated — this kills Lume's `fix-ksplayer-frameworks.sh` hack).
-- **Distribution**: GitHub Actions workflow builds, checksums, and attaches artifacts to releases; `Package.swift` consumes them as `binaryTarget(url:checksum:)` with a local-path override for development.
+- **Distribution**: GitHub Actions workflow builds, checksums, and attaches artifacts to releases; `Package.swift` consumes them as `binaryTarget(url:checksum:)` with a local-path override for development. *(Status: the release workflow builds and checksums all 10 slices, but `Package.swift` still uses the local-path `binaryTarget` only — the switch to `url:checksum:` lands with the first tagged release, and until then every clone must run the FFmpeg build once.)*
 - **Upgrade drill documented**: bump manifest → CI builds → engine test suite runs against new binaries. Staying current is a process, not a project.
 
-Licensing note: engine code Apache-2.0/MIT; FFmpeg LGPL 2.1+ and libass ISC as binary deps. For AGPL Lume this is trivially fine; for other consumers we document LGPL §6 obligations (dynamic xcframework linking satisfies relinkability).
+Licensing note: engine code is **MIT** (`LICENSE`); FFmpeg is LGPL 2.1+, and the visionOS patch under `build/patches/` is a modification of LGPL source and carries that license too. libass (ISC) joins the list when it is actually built. For AGPL Lume this is trivially fine; for other consumers the LGPL §6 obligations, and why dynamic linking plus a reproducible in-repo FFmpeg build satisfies relinkability, are documented in `THIRD-PARTY-NOTICES.md`.
 
 ---
 

@@ -1,0 +1,130 @@
+name: 🐞 Bug report
+description: Report something that isn't working as expected.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please fill out the sections below.
+
+        ⚠️ **Do not include real provider credentials, playlist URLs, or stream links.**
+        LumeEngine is a player engine only. If a bug reproduces on one specific stream,
+        describe the stream's *properties* — container, codecs, live vs VOD, anything odd
+        about its timestamps — or add a fixture recipe to `generate-fixtures.sh`.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched [existing issues](https://github.com/bilipp/LumeEngine/issues) and didn't find a duplicate.
+          required: true
+        - label: I'm on the latest commit of `main`.
+          required: false
+        - label: My report contains no credentials, playlist URLs, or stream links.
+          required: true
+        - label: This is not a security vulnerability (those go to [SECURITY.md](https://github.com/bilipp/LumeEngine/blob/main/SECURITY.md)).
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug — what you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce it? A failing test or a `generate-fixtures.sh` recipe is the gold standard.
+      placeholder: |
+        1. Load a stream with '…'
+        2. Seek to '…'
+        3. Audio starts crackling after ~30 s
+    validations:
+      required: true
+  - type: textarea
+    id: events
+    attributes:
+      label: Events and errors
+      description: |
+        Which typed `PlayerEvent`s did the session emit, and did you get an `EngineError`?
+        Console output is welcome — redact any URLs or credentials first.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: media
+    attributes:
+      label: Stream / media properties
+      description: |
+        **No URLs.** Container (MPEG-TS, HLS, MKV, MP4…), video and audio codecs, channel
+        layout, live or VOD, rough bitrate, and anything unusual (timestamp jumps, missing
+        packet durations, no range requests, remuxed by the provider…).
+      placeholder: "Live MPEG-TS, H.264 + E-AC-3 5.1, ~12 Mbps, provider remux with PTS discontinuities every few minutes"
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where do you think it lives? (Select all that apply — a guess is fine.)
+      multiple: true
+      options:
+        - Demux
+        - Video decode
+        - Audio decode
+        - Subtitles
+        - Render / A-V sync
+        - Seek
+        - Session lifecycle / teardown
+        - Now Playing / PiP / audio session
+        - Public API (LumePlayer / LumePlayerView)
+        - Build pipeline (FFmpeg xcframework)
+        - Tests / CI
+        - Not sure
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Where does this happen? (Select all that apply.)
+      multiple: true
+      options:
+        - iOS / iPadOS
+        - macOS
+        - tvOS
+        - visionOS
+        - Simulator
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "e.g. tvOS 26.4, iOS 26.4, macOS 26.4"
+    validations:
+      required: false
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: "e.g. Apple TV 4K (3rd gen), iPhone 17 Pro, MacBook Pro M3"
+    validations:
+      required: false
+  - type: input
+    id: commit
+    attributes:
+      label: Engine commit
+      description: Output of `git rev-parse --short HEAD`.
+      placeholder: "3733537"
+    validations:
+      required: false
+  - type: checkboxes
+    id: demo
+    attributes:
+      label: Demo app
+      options:
+        - label: I reproduced this in the demo app (`swift run LumeEngineDemo`) and can share what its diagnostics HUD showed.
+          required: false

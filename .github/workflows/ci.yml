@@ -43,7 +43,65 @@ jobs:
       - name: Run tests
         run: swift test
 
-  # Full 7-slice xcframework build, attached to releases (PLAN.md §5).
+  # Cross-compile the library products for the shipping platforms. `swift test` above
+  # only proves macOS: platform-conditional code (VideoToolbox paths, PiP, audio session)
+  # can break iOS/tvOS without a macOS build noticing. Compile-only — no simulator run —
+  # so this costs one FFmpeg slice per platform and nothing else.
+  #
+  # visionOS is deliberately absent: the xrOS SDK is not reliably present on hosted
+  # runners. Build it locally (`build/scripts/build-ffmpeg.sh xros-arm64`, then
+  # `xcodebuild build -scheme LumeEngine -destination 'generic/platform=visionOS'`)
+  # when touching anything platform-conditional.
+  build-platforms:
+    name: Build (${{ matrix.platform }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            slice: ios-arm64
+            destination: generic/platform=iOS
+          - platform: tvOS
+            slice: tvos-arm64
+            destination: generic/platform=tvOS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app || sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+
+      - name: Cache FFmpeg build
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: build/output
+          key: ffmpeg-${{ hashFiles('build/versions.json', 'build/scripts/**', 'build/patches/**') }}-${{ matrix.slice }}
+
+      - name: Download FFmpeg source
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          URL=$(python3 -c "import json;print(json.load(open('build/versions.json'))['ffmpeg']['url'])")
+          SHA=$(python3 -c "import json;print(json.load(open('build/versions.json'))['ffmpeg']['sha256'])")
+          curl -sL -o "build/$(basename "$URL")" "$URL"
+          echo "$SHA  build/$(basename "$URL")" | shasum -a 256 -c -
+
+      - name: Build FFmpeg (${{ matrix.slice }})
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: build/scripts/build-ffmpeg.sh ${{ matrix.slice }}
+
+      - name: Package xcframework
+        run: build/scripts/make-xcframework.sh
+
+      - name: Build LumeEngine for ${{ matrix.platform }}
+        run: |
+          set -euo pipefail   # without this, piping to tail would swallow build failures
+          xcodebuild build \
+            -scheme LumeEngine \
+            -destination '${{ matrix.destination }}' \
+            | tail -20
+
+  # Full 10-slice xcframework build, attached to releases (PLAN.md §5).
   release-binaries:
     name: Release xcframework
     if: startsWith(github.ref, 'refs/tags/')

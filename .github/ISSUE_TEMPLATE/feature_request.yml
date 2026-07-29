@@ -1,0 +1,84 @@
+name: 💡 Feature request
+description: Suggest a capability or enhancement for the engine.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Please open this **before** starting implementation work so we
+        can agree on the approach — see [CONTRIBUTING.md](https://github.com/bilipp/LumeEngine/blob/main/CONTRIBUTING.md).
+
+        Two things worth checking first:
+        - **[PLAN.md](https://github.com/bilipp/LumeEngine/blob/main/PLAN.md) §9** — it may already be on the roadmap.
+        - **PLAN.md §2** — some things are deliberately out of scope. The engine reports typed
+          errors and events and never retries on its own schedule; reconnect policy, backoff,
+          engine fallback, and UI belong to the consuming app.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched [existing issues](https://github.com/bilipp/LumeEngine/issues) and didn't find a duplicate.
+          required: true
+        - label: I checked PLAN.md §9 (roadmap) and §2 (scope).
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve, or what's missing today? Real playback scenarios are more persuasive than abstractions.
+      placeholder: "Streams from providers that … currently fail because …"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe what you'd like the engine to do.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Effect on the invariants
+      description: |
+        Does this touch the control-plane/data-plane split, session epochs, timestamp
+        unwrapping, or A/V sync ownership (PLAN.md §3–§4)? If so, how does it stay within
+        them? "I'm not sure" is a fine answer — say so and we'll work it out.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative approaches or workarounds you've thought about.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Demux
+        - Video decode
+        - Audio decode
+        - Subtitles
+        - Render / A-V sync
+        - Seek / buffering
+        - Session lifecycle
+        - Now Playing / PiP / audio session
+        - Public API (LumePlayer / LumePlayerView)
+        - Build pipeline (FFmpeg xcframework)
+        - Tests / CI
+        - Docs
+    validations:
+      required: false
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to work on this myself.
+          required: false

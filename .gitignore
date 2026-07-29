@@ -10,3 +10,9 @@ build/*.tar.xz
 build/*.tar.bz2
 BinaryDependencies/
 TestStreams/generated/
+
+# Local agent/editor state (machine-specific, never committed)
+.claude/settings.local.json
+.vscode/settings.json
+*.xcuserstate
+xcuserdata/

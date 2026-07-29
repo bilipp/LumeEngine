@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code and others) when working with code in this repository. `CLAUDE.md` is a symlink to it.
 
 ## What this is
 
@@ -13,7 +13,12 @@ The consumer app lives in the sibling repo `../Lume`. Most bug reports and featu
 - Lume ships four engines behind an engine-priority fallback chain: LumeEngine (beta), KSPlayer, VLC, and AVPlayer. The LumeEngine integration code lives in `../Lume/Lume/Views/Player/` (`LumeEngineEngineView.swift`, `LumeEngineCoordinator.swift`, `LumeEngineControlsOverlay.swift`) — engine-side fixes go here, app-side wiring there.
 - The consumer contract LumeEngine must satisfy (PLAN.md §2.1) is defined by `../Lume/Lume/Views/Player/` (`TVPlaybackEngine.swift`, `PlaybackClock.swift`, `PlaybackRetryController.swift`, the other `*EngineView.swift` implementations) and `../Lume/Lume/Services/Player/PlayableMedia.swift`.
 - Division of responsibility: the engine reports typed errors/events and never retries on its own schedule — reconnect/backoff policy, engine fallback, and UI overlays are Lume's job.
-- Lume has its own `CLAUDE.md`; consult it when working on that side.
+- Lume has its own `AGENTS.md` (with a `CLAUDE.md` symlink); consult it when working on that side.
+- Lume references this repo as a **local** SPM package at `../LumeEngine`, so uncommitted engine changes build straight into the app — and a Lume clone without a LumeEngine sibling (plus its FFmpeg xcframework) will not resolve. Both repos' contributor docs say so; keep them in sync.
+
+## Licensing (public repo)
+
+Engine source is **MIT** (`LICENSE`). FFmpeg is linked under the **LGPL 2.1+**, and anything added under `build/patches/` modifies FFmpeg source and is therefore LGPL, not MIT. `THIRD-PARTY-NOTICES.md` is the single source of truth for what is linked and what downstream apps must do; update it in the same change whenever you touch `build/versions.json`, the configure flags in `build/scripts/build-ffmpeg.sh`, or the patch set. Two claims there are load-bearing and must stay true: the build is LGPL (`--disable-gpl --disable-nonfree`, no GPL external libs), and the `LumeEngine` product stays **dynamic** so FFmpeg remains relinkable.
 
 ## Commands
 
@@ -34,7 +39,7 @@ Prerequisites:
   ```
 - Tests need a host `ffmpeg` CLI (Homebrew) — fixtures are generated lazily on first test run by `Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh` into `TestStreams/generated/` (gitignored, idempotent). `Fixtures.swift` finds Homebrew ffmpeg automatically; override with the `FFMPEG` env var.
 
-CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test`; tagged releases build all 10 platform slices and attach the xcframework.
+CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test`, then cross-compiles the library for iOS and tvOS via `xcodebuild` (compile-only, one cached slice each — visionOS is left to local verification since the xrOS SDK isn't reliable on hosted runners); tagged releases build all 10 platform slices and attach the xcframework.
 
 ## Architecture
 

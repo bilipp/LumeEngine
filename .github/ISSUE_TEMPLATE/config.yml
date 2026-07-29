@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📐 Design document
+    url: https://github.com/bilipp/LumeEngine/blob/main/PLAN.md
+    about: Architecture decisions, the failure modes this engine rules out (§3), and the roadmap (§9). Read this before proposing data-plane changes.
+  - name: 📺 Lume (the app)
+    url: https://github.com/bilipp/Lume
+    about: Bug in the IPTV app rather than the engine? Report it there.
+  - name: 💬 Discord
+    url: https://discord.gg/DMnQfr69Ug
+    about: Ask a question or discuss an idea before filing an issue.
