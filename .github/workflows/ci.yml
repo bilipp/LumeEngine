@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # Without this, a tag push matches no trigger at all and the
+    # release-binaries job below — gated on `refs/tags/` — can never run.
+    tags: ['v*']
   pull_request:
 
 jobs:
