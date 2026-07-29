@@ -156,7 +156,7 @@ LumeEngine *and* another FFmpeg-based engine without symbol or C-module collisio
 ## Testing
 
 ```bash
-swift test                                     # full suite (63 tests, 12 suites)
+swift test                                     # full suite (64 tests, 12 suites)
 swift test --filter TimestampUnwrapperTests    # one suite
 swift test --filter DecoderTests/testName      # one test
 ```

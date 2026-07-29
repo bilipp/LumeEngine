@@ -89,6 +89,36 @@ struct TrackSubtitleTests {
         await session.shutdown()
     }
 
+    @Test("subtitles selected before play backfill cues the demuxer already read", .timeLimit(.minutes(1)))
+    func subtitlesSelectedBeforePlayBackfill() async throws {
+        // multitrack.mkv is 8 s and the default read-ahead is 15 s, so open()
+        // pulls the entire file — every subtitle packet included — into the
+        // packet queues within milliseconds. Waiting here makes that certain
+        // instead of racy: any cue delivery after this point can only come from
+        // selectSubtitleTrack's backfill.
+        //
+        // `embeddedSubtitles` covers the same ground but only catches this by
+        // losing a race, which is why the bug reached CI as an intermittent
+        // failure and passed locally for weeks. Selecting a track before play()
+        // used to skip the backfill entirely and yield a session with subtitles
+        // enabled and permanently zero cues.
+        let session = makeSession()
+        let info = try await session.open(url: try Fixtures.path("multitrack.mkv"))
+        let subtitleTrack = try #require(info.subtitleTracks.first)
+        try await Task.sleep(for: .milliseconds(600))
+
+        await session.selectSubtitleTrack(subtitleTrack.index)
+        await session.play()
+
+        let sawCues = await eventually { session.subtitles.count >= 2 }
+        #expect(sawCues, "backfill must recover cues read before selection, store has \(session.subtitles.count)")
+        let start = info.startTime
+        #expect(session.subtitles.activeCues(at: start + 2_000_000).map(\.text) == ["Hello from LumeEngine"])
+        #expect(session.subtitles.activeCues(at: start + 5_000_000).map(\.text) == ["Second cue"])
+
+        await session.shutdown()
+    }
+
     @Test("external SRT file loads into the cue store", .timeLimit(.minutes(1)))
     func externalSubtitles() async throws {
         // The fixture generator leaves subs.srt next to the media.

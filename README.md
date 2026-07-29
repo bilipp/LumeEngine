@@ -63,7 +63,7 @@ build/scripts/make-xcframework.sh
 
 # 2. Engine
 swift build
-swift test          # 63 tests: unit, fixture-based decode, playback, torture server
+swift test          # 64 tests: unit, fixture-based decode, playback, torture server
 
 # 3. Demo app (macOS)
 swift run LumeEngineDemo

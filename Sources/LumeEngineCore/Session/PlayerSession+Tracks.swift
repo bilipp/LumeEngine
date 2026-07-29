@@ -35,9 +35,21 @@ extension PlayerSession {
         installSubtitleLane(trackIndex: index, packets: packets, decoder: decoder)
         decoder.start()
 
-        // Pick up cues that started before the current demux position.
-        if mediaInfo?.isSeekable == true, state == .playing || state == .paused {
-            seek(to: position)
+        // Pick up cues the demuxer has already read past.
+        //
+        // The demuxer starts filling packet queues at open(), so by the time a
+        // subtitle lane is attached its packets may already be gone — and a
+        // read-ahead longer than the media (or just a small local file) means
+        // *every* subtitle packet can be consumed within milliseconds of open.
+        // This backfill used to be gated on .playing/.paused, which missed the
+        // most natural call order of all: select the track, then play. That
+        // silently produced a session with subtitles enabled and no cues,
+        // permanently for short VOD. Any state with a live demuxer needs it.
+        switch state {
+        case .ready, .buffering, .playing, .paused:
+            if mediaInfo?.isSeekable == true { seek(to: position) }
+        case .idle, .opening, .ended, .failed:
+            break // no demuxer progress to recover from
         }
     }
 
