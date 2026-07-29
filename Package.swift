@@ -63,21 +63,26 @@ let package = Package(
         ffmpegTarget,
 
         // Data plane + control plane core: demux, decode, clock, channels. No UI.
-        // Library evolution + `internal import CFFmpeg` keep the FFmpeg module
-        // out of consumers' compiles entirely — apps can link other FFmpeg-based
-        // engines without C-module type collisions.
+        // `internal import CFFmpeg` keeps FFmpeg types out of this module's public
+        // interface; isolation from another engine's FFmpeg comes from the dynamic
+        // product (two-level namespace) plus headers nested under lume_ffmpeg/.
+        //
+        // No `-enable-library-evolution`: SwiftPM rejects unsafeFlags in any package
+        // consumed as a versioned dependency, which made this package impossible to
+        // add by URL. Evolution only bought ABI resilience, which nothing needs while
+        // the engine is distributed as source — revisit if it is ever shipped as a
+        // prebuilt xcframework, and expect to distribute it that way rather than
+        // through SwiftPM if so.
         .target(
             name: "LumeEngineCore",
             dependencies: ["CFFmpeg"],
-            swiftSettings: [.unsafeFlags(["-enable-library-evolution"])],
             linkerSettings: ffmpegLinkerSettings
         ),
 
         // Public facade (LumePlayer, events, SwiftUI view).
         .target(
             name: "LumeEngine",
-            dependencies: ["LumeEngineCore"],
-            swiftSettings: [.unsafeFlags(["-enable-library-evolution"])]
+            dependencies: ["LumeEngineCore"]
         ),
 
         // macOS demo app: `swift run LumeEngineDemo`.

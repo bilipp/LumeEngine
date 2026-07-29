@@ -55,7 +55,8 @@ CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/
 Three-layer target structure (`Package.swift`):
 
 - **`CFFmpeg`** — binary target wrapping `BinaryDependencies/FFmpeg.xcframework` (FFmpeg 8.1.x static libs, LGPL config, built by `build/scripts/`).
-- **`Sources/LumeEngineCore`** — the engine, no UI. Uses `internal import CFFmpeg` + library evolution so FFmpeg types never leak into consumers' compiles (apps can link other FFmpeg-based engines without symbol/module collisions — this is why the product is a **dynamic** library; don't change that).
+- **`Sources/LumeEngineCore`** — the engine, no UI. `internal import CFFmpeg` keeps FFmpeg types out of the module's public interface, and an app can link other FFmpeg-based engines without symbol or module collisions because the product is a **dynamic** library (two-level namespace) whose FFmpeg headers are nested under `lume_ffmpeg/`. **Don't make the product static** — that is the load-bearing part. Note that a consumer *can* still `import CFFmpeg` explicitly if it wants to; the guarantee is about collisions and about the facade's own API surface, not about hiding the module from the package graph.
+- **No `-enable-library-evolution`.** It was removed deliberately: SwiftPM forbids `unsafeFlags` in packages consumed as a versioned dependency, so the flag made `.package(url:from:)` fail outright. It only provided ABI resilience, which is meaningless while the engine ships as source. If the engine is ever distributed as a prebuilt xcframework, evolution comes back — and that build won't go through SwiftPM.
 - **`Sources/LumeEngine`** — public facade: `LumePlayer` (`@MainActor @Observable`), `LumePlayerView` (SwiftUI).
 
 ### Control plane vs data plane (PLAN.md D1)

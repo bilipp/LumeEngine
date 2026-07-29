@@ -8,7 +8,7 @@ An FFmpeg 8-based media player engine for Apple platforms, designed from scratch
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-8.1.2%20LGPL-007808?labelColor=1f1f2e)](THIRD-PARTY-NOTICES.md)
 [![License](https://img.shields.io/badge/license-MIT-blue?labelColor=1f1f2e)](LICENSE)
 
-> **Status: pre-1.0, beta.** The engine plays real IPTV content and ships as an opt-in beta engine in Lume, but the public API is not yet frozen and there is no tagged release. Expect breaking changes on `main`.
+> **Status: pre-1.0, beta.** The engine plays real IPTV content and ships as an opt-in beta engine in Lume, but the public API is not yet frozen — expect breaking changes between 0.x releases.
 
 An original architecture, not a fork of an existing player. See [PLAN.md](PLAN.md) for the full design document, including the catalog of legacy-engine failure modes this engine makes structurally impossible (§3), the architecture decisions (§4), and the roadmap (§9).
 
@@ -32,7 +32,7 @@ Add the package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/bilipp/LumeEngine.git", from: "0.1.1")
+    .package(url: "https://github.com/bilipp/LumeEngine.git", from: "0.1.2")
 ],
 targets: [
     .target(name: "YourApp", dependencies: ["LumeEngine"])
