@@ -152,14 +152,18 @@ DemoApp/                   macOS demo with diagnostics HUD
 Tests/LumeEngineCoreTests/ Suite, fixtures, fault-injecting HTTP server
 ```
 
-`LumeEngineCore` uses `internal import CFFmpeg` so FFmpeg types stay out of its public
-interface, and the `LumeEngine` product is a **dynamic** library whose FFmpeg headers are
-nested under `lume_ffmpeg/`. Keep both — together they are what lets an app link
+`LumeEngineCore` uses `internal import CFFmpeg` plus library evolution so FFmpeg types
+never leak into consumers' compiles. Keep it that way — it is what lets an app link
 LumeEngine *and* another FFmpeg-based engine without symbol or C-module collisions.
+Removing the evolution flag broke Lume within one build: it links FFmpegKit as well, and
+Clang rejected the two conflicting `enum AVPixelFormat` definitions coming from
+`CFFmpeg` and `Libavutil`.
 
-Don't add `-enable-library-evolution` (or any other `unsafeFlags`) to the library targets:
-SwiftPM rejects unsafe flags in packages consumed as a versioned dependency, so it would
-make the package unusable via `.package(url:from:)`.
+Because SwiftPM forbids `unsafeFlags` in version-resolved dependencies — and offers no
+safe library-evolution setting — the flag is applied conditionally in `Package.swift`:
+everywhere except when the package itself is consumed by URL. If you add a package
+dependency that must coexist with another FFmpeg, vendor it by path so evolution stays
+on. Don't remove either conditional in the manifest without reading its comments.
 
 ---
 

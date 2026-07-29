@@ -32,7 +32,7 @@ Add the package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/bilipp/LumeEngine.git", from: "0.1.2")
+    .package(url: "https://github.com/bilipp/LumeEngine.git", from: "0.1.3")
 ],
 targets: [
     .target(name: "YourApp", dependencies: ["LumeEngine"])
@@ -53,6 +53,14 @@ working on the engine itself, or want to build FFmpeg differently — see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Requires Xcode 26+, and iOS 18+ / tvOS 18+ / macOS 15+ / visionOS 2+.
+
+> **If your app also links another FFmpeg-based player** (KSPlayer/FFmpegKit, VLCKit, …),
+> add LumeEngine as a **path or submodule dependency** rather than by URL. The engine
+> normally builds with library evolution, which keeps its FFmpeg C module out of your
+> compile — but SwiftPM forbids the flag that enables it in version-resolved
+> dependencies, so a URL dependency drops it and your build hits conflicting definitions
+> of FFmpeg's C types (`enum AVPixelFormat` from `CFFmpeg` vs `Libavutil`). A path
+> dependency keeps evolution on and compiles cleanly. This is how Lume itself integrates.
 
 ## Usage
 
