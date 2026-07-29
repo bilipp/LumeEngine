@@ -80,11 +80,25 @@ struct ResilienceTests {
 
     @Test("surplus delivery accumulates into the packet read-ahead", .timeLimit(.minutes(1)))
     func readAheadAccumulation() async throws {
-        // seekcues.mkv: 5.4 MB / 60 s ≈ 90 KB/s. Served at ~1.4× (126 KB/s),
-        // the pipeline must bank the ~0.4× surplus into the packet queues
-        // while playing — that accumulated runway is what absorbs the
-        // delivery gaps of bursty IPTV sources.
-        let server = try TortureHTTPServer(mode: .throttled(file: Fixtures.url("seekcues.mkv"), bytesPerSecond: 126_000))
+        // Serve seekcues.mkv at 1.4× its own realtime bitrate: the pipeline must
+        // bank the 0.4× surplus into the packet queues while playing, and that
+        // accumulated runway is what absorbs the delivery gaps of bursty IPTV
+        // sources.
+        //
+        // The rate is derived from the fixture rather than hardcoded. Fixtures are
+        // encoded by whatever host ffmpeg/x264 is installed, and `-preset ultrafast`
+        // with no rate target makes the size version-dependent — a hardcoded
+        // 126_000 B/s was 1.40× on one machine and could be ~1.0× on another,
+        // which silently turns "surplus" into "just barely enough" and fails the
+        // accumulation expectations for reasons that have nothing to do with the
+        // engine.
+        let fixture = try Fixtures.url("seekcues.mkv")
+        let fixtureBytes = try FileManager.default.attributesOfItem(atPath: fixture.path)[.size] as? Int ?? 0
+        let realtimeBytesPerSecond = Double(fixtureBytes) / 60.0 // fixture is 60 s by construction
+        let deliveryRate = Int(realtimeBytesPerSecond * 1.4)
+        #expect(fixtureBytes > 0, "fixture missing or empty")
+
+        let server = try TortureHTTPServer(mode: .throttled(file: fixture, bytesPerSecond: deliveryRate))
         defer { server.stop() }
 
         let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 30))
@@ -97,8 +111,12 @@ struct ResilienceTests {
         let diagnostics = await session.diagnostics
         let videoRunway = (diagnostics.videoQueue?.seconds ?? 0) + (diagnostics.videoPacketQueue?.seconds ?? 0)
         let audioRunway = (diagnostics.audioQueue?.seconds ?? 0) + (diagnostics.audioPacketQueue?.seconds ?? 0)
-        #expect(videoRunway > 2.5, "video pipeline must accumulate surplus, got \(videoRunway)s")
-        #expect(audioRunway > 2.5, "audio pipeline must accumulate surplus, got \(audioRunway)s")
+        // Failure messages carry the delivery parameters: if this ever fails on a
+        // machine that isn't at hand, the first question is whether the feed really
+        // was 1.4× realtime.
+        let feed = "fed \(deliveryRate) B/s = 1.4x of \(Int(realtimeBytesPerSecond)) B/s realtime"
+        #expect(videoRunway > 2.5, "video pipeline must accumulate surplus, got \(videoRunway)s (\(feed))")
+        #expect(audioRunway > 2.5, "audio pipeline must accumulate surplus, got \(audioRunway)s (\(feed))")
         #expect(await session.state == .playing, "playback must continue while accumulating")
         await session.shutdown()
     }

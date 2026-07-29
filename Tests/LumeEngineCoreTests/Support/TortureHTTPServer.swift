@@ -138,13 +138,37 @@ final class TortureHTTPServer: @unchecked Sendable {
         case .throttled(let url, let bytesPerSecond):
             guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
             let chunk = max(1, bytesPerSecond / 10)
+            let interval = Double(chunk) / Double(bytesPerSecond)
             connection.send(content: header(totalLength: payload.count), completion: .contentProcessed { [weak self] _ in
-                self?.sendPaced(payload: payload, offset: 0, chunk: chunk, on: connection)
+                // Timeline starts when the body starts, so chunk N is due at
+                // start + N * interval regardless of how long sends take.
+                self?.sendPaced(payload: payload, offset: 0, chunk: chunk, interval: interval, start: .now(), index: 0, on: connection)
             })
         }
     }
 
-    private func sendPaced(payload: Data, offset: Int, chunk: Int, on connection: NWConnection) {
+    /// Delivers `payload` at `chunk / interval` bytes per second.
+    ///
+    /// Each chunk is scheduled against an **absolute** timeline (`start + index *
+    /// interval`) rather than "wait `interval` after the previous send finished".
+    /// The naive form silently under-delivers: its real period is `interval` *plus*
+    /// send-completion latency and dispatch slop, so on a loaded machine a nominal
+    /// 1.4×-realtime feed degrades toward 1.0× and tests that depend on the surplus
+    /// (`readAheadAccumulation`) fail for want of CPU rather than for a real defect.
+    /// Chaining on the completion handler is kept deliberately: at most one send is
+    /// outstanding, so a client that stops reading applies backpressure instead of
+    /// letting chunks pile up inside `NWConnection` and burst later. A late chunk
+    /// gets a past deadline and fires immediately, which catches drift back up
+    /// without ever exceeding the nominal rate.
+    private func sendPaced(
+        payload: Data,
+        offset: Int,
+        chunk: Int,
+        interval: Double,
+        start: DispatchTime,
+        index: Int,
+        on connection: NWConnection
+    ) {
         guard offset < payload.count else {
             connection.cancel()
             return
@@ -153,8 +177,10 @@ final class TortureHTTPServer: @unchecked Sendable {
         let slice = payload.subdata(in: offset..<end)
         connection.send(content: slice, completion: .contentProcessed { [weak self] error in
             guard error == nil, let self else { return connection.cancel() }
-            self.queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
-                self.sendPaced(payload: payload, offset: end, chunk: chunk, on: connection)
+            let next = index + 1
+            let due = start + .nanoseconds(Int(Double(next) * interval * 1_000_000_000))
+            self.queue.asyncAfter(deadline: due) {
+                self.sendPaced(payload: payload, offset: end, chunk: chunk, interval: interval, start: start, index: next, on: connection)
             }
         })
     }
