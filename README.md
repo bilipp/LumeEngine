@@ -3,7 +3,7 @@
 An FFmpeg 8-based media player engine for Apple platforms, designed from scratch for stability on long-running IPTV streams. Built for [Lume](https://github.com/bilipp/Lume).
 
 [![CI](https://github.com/bilipp/LumeEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/bilipp/LumeEngine/actions/workflows/ci.yml)
-[![Platforms](https://img.shields.io/badge/platforms-iOS%2018%20·%20tvOS%2018%20·%20macOS%2015%20·%20visionOS%202-1f1f2e?labelColor=1f1f2e)](#requirements)
+[![Platforms](https://img.shields.io/badge/platforms-iOS%2018%20·%20tvOS%2018%20·%20macOS%2015%20·%20visionOS%202-1f1f2e?labelColor=1f1f2e)](#installation)
 [![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white&labelColor=1f1f2e)](https://swift.org)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-8.1.2%20LGPL-007808?labelColor=1f1f2e)](THIRD-PARTY-NOTICES.md)
 [![License](https://img.shields.io/badge/license-MIT-blue?labelColor=1f1f2e)](LICENSE)
@@ -26,6 +26,34 @@ An original architecture, not a fork of an existing player. See [PLAN.md](PLAN.m
 
 The engine decodes and renders, and reports what happened. It does **not** retry on its own schedule: reconnect policy, backoff, engine fallback, and UI belong to the consuming app. Failures surface as typed `EngineError`s and `PlayerEvent`s on the session's `AsyncStream` — never as a log line you have to parse, and never as silence. See PLAN.md §2.
 
+## Installation
+
+Add the package to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/bilipp/LumeEngine.git", from: "0.1.1")
+],
+targets: [
+    .target(name: "YourApp", dependencies: ["LumeEngine"])
+]
+```
+
+Or in Xcode: **File ▸ Add Package Dependencies…**, paste
+`https://github.com/bilipp/LumeEngine.git`, and add the `LumeEngine` library to your
+app target. Xcode embeds and signs it for you; if you wire it up by hand, make sure
+`LumeEngine` is in **Embed Frameworks** with *Embed & Sign* — the product is a dynamic
+library ([on purpose](#license)).
+
+**You do not need the FFmpeg build pipeline to consume the package.** SwiftPM downloads
+a prebuilt, checksum-pinned `FFmpeg.xcframework` from the release attached to this
+repository — a 117 MB download that expands to ~270 MB, covering all 10 platform slices,
+cached across builds. The `build/` directory matters only if you are
+working on the engine itself, or want to build FFmpeg differently — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Requires Xcode 26+, and iOS 18+ / tvOS 18+ / macOS 15+ / visionOS 2+.
+
 ## Usage
 
 ```swift
@@ -45,31 +73,24 @@ await session.play()
 for await event in session.events { ... }
 ```
 
-## Requirements
+## Building from source
 
-- Xcode 26+ (Swift 6.3 toolchain)
-- iOS 18+, tvOS 18+, macOS 15+, visionOS 2+
-- A host `ffmpeg` CLI for test-fixture generation (`brew install ffmpeg`) — a build-time tool, unrelated to the FFmpeg the engine links
+Only needed to work *on* the engine — consumers get the FFmpeg binary from the release (see [Installation](#installation)). Cloning the repo and running `swift build` works the same way: with no `BinaryDependencies/FFmpeg.xcframework` present, the manifest falls back to the released artifact and downloads it.
 
-## Building
-
-`BinaryDependencies/FFmpeg.xcframework` must exist before anything compiles. It is built from source by the in-repo pipeline and is deliberately not committed, so **the first build is not a plain `swift build`** — budget 10–20 minutes for the one slice you need:
+To build FFmpeg yourself instead — required if you change `build/versions.json`, the configure flags, or the patch set — put the result where the manifest prefers it, and it takes precedence over the download:
 
 ```bash
-# 1. FFmpeg xcframework (once, or after bumping build/versions.json)
+# FFmpeg xcframework (10-20 min for one slice)
 curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
 build/scripts/build-ffmpeg.sh macos-arm64        # one slice is enough for local dev
-build/scripts/make-xcframework.sh
+build/scripts/make-xcframework.sh                # -> BinaryDependencies/FFmpeg.xcframework
 
-# 2. Engine
 swift build
 swift test          # 64 tests: unit, fixture-based decode, playback, torture server
-
-# 3. Demo app (macOS)
-swift run LumeEngineDemo
+swift run LumeEngineDemo                         # macOS demo with diagnostics HUD
 ```
 
-The full 10-slice matrix (`build/scripts/platforms.sh`) is only needed for release binaries, which CI builds on tags. Test fixtures are generated on first test run via the host `ffmpeg`.
+Testing needs a host `ffmpeg` CLI (`brew install ffmpeg`) to generate fixtures on first run — a build-time tool, unrelated to the FFmpeg the engine links. The full 10-slice matrix (`build/scripts/platforms.sh`) is only needed for release binaries, which CI builds on tags.
 
 ## Layout
 

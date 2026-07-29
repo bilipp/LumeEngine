@@ -62,31 +62,36 @@ is not tolerated.
 
 ### First-time setup
 
-`BinaryDependencies/FFmpeg.xcframework` must exist before anything compiles — it is
-built from source by the in-repo pipeline and is deliberately **not** committed:
-
 ```bash
 git clone https://github.com/bilipp/LumeEngine.git
 cd LumeEngine
-
-# 1. FFmpeg (once, or after bumping build/versions.json)
-curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
-build/scripts/build-ffmpeg.sh macos-arm64     # ~10-20 min for one slice
-build/scripts/make-xcframework.sh
-
-# 2. Engine
 swift build
 swift test
 ```
 
-**One slice is enough for local development.** `build-ffmpeg.sh macos-arm64` plus
-`make-xcframework.sh` produces a single-slice xcframework that builds and tests fine on
-macOS; you only need the full 10-slice matrix (`build/scripts/platforms.sh`) when you
-are producing release binaries, which CI does for you on tags.
+That works with no FFmpeg build: `Package.swift` falls back to the checksum-pinned
+`FFmpeg.xcframework` attached to a release and SwiftPM downloads it (~270 MB, cached
+afterwards). Most engine work — demux, decode, session, render, subtitles — needs
+nothing more.
 
-If you change anything under `build/`, bump or re-run the pipeline and say so in the PR
-— CI caches the FFmpeg build on the hash of `build/versions.json`, `build/scripts/**`,
-and `build/patches/**`.
+**Building FFmpeg yourself** is required only when you change `build/versions.json`, the
+configure flags in `build/scripts/build-ffmpeg.sh`, or the patch set — otherwise you
+would be testing against the released binary rather than your change:
+
+```bash
+curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+build/scripts/build-ffmpeg.sh macos-arm64     # ~10-20 min for one slice
+build/scripts/make-xcframework.sh             # -> BinaryDependencies/FFmpeg.xcframework
+```
+
+`BinaryDependencies/FFmpeg.xcframework` is gitignored, and the manifest **prefers it
+whenever it exists** — that is the development override. Delete the directory to go back
+to the released artifact. One slice is enough for local work; the full 10-slice matrix
+(`build/scripts/platforms.sh`) is only for release binaries, which CI builds on tags.
+
+If you change anything under `build/`, say so in the PR — CI caches the FFmpeg build on
+the hash of `build/versions.json`, `build/scripts/**`, and `build/patches/**`, and the
+released artifact URL in `Package.swift` has to move in the same change.
 
 ---
 

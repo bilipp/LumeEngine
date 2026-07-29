@@ -16,6 +16,15 @@ The consumer app lives in the sibling repo `../Lume`. Most bug reports and featu
 - Lume has its own `AGENTS.md` (with a `CLAUDE.md` symlink); consult it when working on that side.
 - Lume references this repo as a **local** SPM package at `../LumeEngine`, so uncommitted engine changes build straight into the app — and a Lume clone without a LumeEngine sibling (plus its FFmpeg xcframework) will not resolve. Both repos' contributor docs say so; keep them in sync.
 
+## How FFmpeg reaches the build
+
+`Package.swift` resolves the `CFFmpeg` binary target two ways, and the conditional is deliberate — don't "simplify" it away:
+
+- `BinaryDependencies/FFmpeg.xcframework` exists → local `path:` binary target. This is the development override, so anyone iterating on `build/` tests their own FFmpeg.
+- Otherwise → `binaryTarget(url:checksum:)` against the artifact attached to a GitHub release. Consumers (and a plain `git clone && swift build`) take this path and need nothing from `build/`.
+
+The artifact URL is versioned by the FFmpeg build it contains, not by the engine release it hangs off: bump it only when `build/versions.json`, the configure flags, or the patch set change — and then in the same change as the pipeline edit, or consumers link a binary that doesn't match the source.
+
 ## Licensing (public repo)
 
 Engine source is **MIT** (`LICENSE`). FFmpeg is linked under the **LGPL 2.1+**, and anything added under `build/patches/` modifies FFmpeg source and is therefore LGPL, not MIT. `THIRD-PARTY-NOTICES.md` is the single source of truth for what is linked and what downstream apps must do; update it in the same change whenever you touch `build/versions.json`, the configure flags in `build/scripts/build-ffmpeg.sh`, or the patch set. Two claims there are load-bearing and must stay true: the build is LGPL (`--disable-gpl --disable-nonfree`, no GPL external libs), and the `LumeEngine` product stays **dynamic** so FFmpeg remains relinkable.
