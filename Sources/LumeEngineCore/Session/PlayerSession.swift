@@ -147,7 +147,7 @@ public actor PlayerSession {
 
         let pump = Task { [events = demuxer.events] in
             for await event in events {
-                await self.handleDemux(event)
+                self.handleDemux(event)
             }
         }
         pumpTasks.append(pump)
@@ -205,7 +205,7 @@ public actor PlayerSession {
             videoDecoder = decoder
             let pump = Task { [events = decoder.events] in
                 for await event in events {
-                    await self.handleDecode(event, isVideo: true)
+                    self.handleDecode(event, isVideo: true)
                 }
             }
             pumpTasks.append(pump)
@@ -223,7 +223,7 @@ public actor PlayerSession {
             audioDecoder = decoder
             let pump = Task { [events = decoder.events] in
                 for await event in events {
-                    await self.handleDecode(event, isVideo: false)
+                    self.handleDecode(event, isVideo: false)
                 }
             }
             pumpTasks.append(pump)
@@ -465,7 +465,7 @@ public actor PlayerSession {
         selectedAudioTrackIndex = trackIndex
         let pump = Task { [events = decoder.events] in
             for await event in events {
-                await self.handleDecode(event, isVideo: false)
+                self.handleDecode(event, isVideo: false)
             }
         }
         pumpTasks.append(pump)
