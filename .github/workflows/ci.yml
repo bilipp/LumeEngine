@@ -48,10 +48,13 @@ jobs:
   # can break iOS/tvOS without a macOS build noticing. Compile-only — no simulator run —
   # so this costs one FFmpeg slice per platform and nothing else.
   #
-  # visionOS is deliberately absent: the xrOS SDK is not reliably present on hosted
-  # runners. Build it locally (`build/scripts/build-ffmpeg.sh xros-arm64`, then
-  # `xcodebuild build -scheme LumeEngine -destination 'generic/platform=visionOS'`)
-  # when touching anything platform-conditional.
+  # visionOS is absent because this matrix entry has never been verified: the xrOS
+  # SDK ships with Xcode (the release job's preflight checks for it), but building
+  # to a visionOS *destination* additionally needs Xcode's visionOS platform
+  # component, which was not installed on the machine this was written on. Add the
+  # entry once someone can confirm a hosted runner builds
+  # `-destination 'generic/platform=visionOS'`; until then verify visionOS locally
+  # when touching platform-conditional code.
   build-platforms:
     name: Build (${{ matrix.platform }})
     runs-on: macos-15
@@ -106,8 +109,28 @@ jobs:
     name: Release xcframework
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-15
+    # The repository's default workflow token is read-only, so the upload below
+    # needs this explicitly — otherwise the whole 10-slice build finishes and
+    # then fails at the last step.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+      # Fail in seconds rather than after a 40-minute build. build-ffmpeg.sh
+      # resolves each slice's SDK through `xcrun --sdk`, so an SDK absent from the
+      # runner image can only yield an incomplete xcframework — better to say so
+      # up front than to publish a release with slices silently missing.
+      - name: Verify platform SDKs
+        run: |
+          missing=""
+          for sdk in macosx iphoneos iphonesimulator appletvos appletvsimulator xros xrsimulator; do
+            xcrun --sdk "$sdk" --show-sdk-path >/dev/null 2>&1 || missing="$missing $sdk"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing SDKs on this runner:$missing — cannot build a complete xcframework"
+            exit 1
+          fi
+          echo "all 7 platform SDKs present"
       - name: Download FFmpeg source
         run: |
           URL=$(python3 -c "import json;print(json.load(open('build/versions.json'))['ffmpeg']['url'])")

@@ -39,7 +39,7 @@ Prerequisites:
   ```
 - Tests need a host `ffmpeg` CLI (Homebrew) — fixtures are generated lazily on first test run by `Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh` into `TestStreams/generated/` (gitignored, idempotent). `Fixtures.swift` finds Homebrew ffmpeg automatically; override with the `FFMPEG` env var.
 
-CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test`, then cross-compiles the library for iOS and tvOS via `xcodebuild` (compile-only, one cached slice each — visionOS is left to local verification since the xrOS SDK isn't reliable on hosted runners); tagged releases build all 10 platform slices and attach the xcframework.
+CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test`, then cross-compiles the library for iOS and tvOS via `xcodebuild` (compile-only, one cached slice each — visionOS is left to local verification because that matrix entry was never confirmed on a runner — the xrOS SDK ships with Xcode, but a visionOS *destination* also needs Xcode's visionOS platform component); tagged releases build all 10 platform slices and attach the xcframework.
 
 ## Architecture
 
