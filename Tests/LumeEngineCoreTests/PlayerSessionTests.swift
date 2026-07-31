@@ -84,11 +84,15 @@ struct PlayerSessionTests {
         let landedPosition = await session.position
         #expect(landed, "position should land near 7 s, got \(landedPosition)")
 
-        // Still playing after the seek.
+        // Still playing after the seek. Poll for progress instead of measuring
+        // a rate over a fixed window: the landing check above is satisfied the
+        // moment the renderer anchors at the target with the rate still 0, so a
+        // short window can be spent almost entirely on the post-seek rebuffer
+        // (the same race that made the audio-switch test flake in CI).
         let p1 = await session.position
-        try await Task.sleep(for: .milliseconds(700))
+        let advanced = await eventually(timeout: 15) { await session.position > p1 + 0.3 }
         let p2 = await session.position
-        #expect(p2 > p1 + 0.3, "playback must continue after seek")
+        #expect(advanced, "playback must continue after seek (was \(p1), now \(p2))")
 
         await session.shutdown()
     }
