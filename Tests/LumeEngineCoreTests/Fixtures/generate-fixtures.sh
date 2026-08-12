@@ -8,6 +8,7 @@
 #   multitrack.mkv — video + 2 audio languages + SRT subtitles + chapters
 #   surround71.mkv — FLAC 7.1 audio-only
 #   truehd.mkv     — TrueHD 5.1 audio-only (40-sample access units)
+#   interlaced.ts  — 1080i-style MPEG-TS, field-coded, TFF (deinterlacer input)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -58,6 +59,16 @@ gen truehd.mkv \
     -f lavfi -i "sine=frequency=440:duration=4" \
     -af "aformat=channel_layouts=5.1(side):sample_rates=48000" \
     -c:a truehd -strict -2
+
+# Interlaced MPEG-TS, the shape European broadcast (and therefore IPTV) sport
+# arrives in: 50 fields/s woven into 25 flagged interlaced frames, top field
+# first. `interlace` halves the 50p source into 25i; +ilme+ildct makes the
+# encoder code the fields rather than quietly encoding a combed progressive
+# frame, so the decoder actually sets AV_FRAME_FLAG_INTERLACED.
+gen interlaced.ts \
+    -f lavfi -i "testsrc2=duration=4:size=640x360:rate=50" \
+    -vf "interlace=scan=tff" \
+    -c:v mpeg2video -flags +ilme+ildct -top 1 -g 25 -f mpegts
 
 if [ ! -f "$OUT/multitrack.mkv" ]; then
     cat > "$OUT/subs.srt" <<'SRT'

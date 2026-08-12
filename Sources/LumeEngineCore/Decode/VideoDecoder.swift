@@ -28,6 +28,45 @@ public final class VideoDecoder: @unchecked Sendable {
         case software
     }
 
+    /// Deinterlacing policy. Interlaced content — most European broadcast
+    /// television, so most IPTV sport — is displayed combed by any renderer
+    /// that treats a field pair as one frame: horizontal fringes on anything
+    /// that moves between the two fields.
+    public struct Deinterlacing: Sendable, Equatable {
+        public enum Mode: Sendable, Equatable {
+            /// Never filter; every frame stays on the zero-copy hardware path.
+            case off
+            /// Filter once the decoder reports an interlaced frame
+            /// (`AV_FRAME_FLAG_INTERLACED`). Detection comes from decoded-frame
+            /// metadata, never from FFmpeg log strings (PLAN.md §3, failure 6).
+            case auto
+            /// Filter unconditionally — for encoders that ship interlaced
+            /// content without flagging it, which IPTV transcoders do.
+            case always
+        }
+
+        public enum Rate: Sendable, Equatable {
+            /// One output frame per *field*: 1080i50 becomes 1080p50. Removes
+            /// combing and doubles temporal resolution, which is what makes
+            /// panning shots of a football pitch look right. Doubles the
+            /// downstream frame rate, and with it render-side work.
+            case field
+            /// One output frame per input frame: 1080i50 becomes 1080p25.
+            /// Half the output rate, so noticeably cheaper.
+            case frame
+        }
+
+        public var mode: Mode
+        public var rate: Rate
+
+        public init(mode: Mode = .auto, rate: Rate = .field) {
+            self.mode = mode
+            self.rate = rate
+        }
+
+        public static let off = Deinterlacing(mode: .off)
+    }
+
     public let events: AsyncStream<DecodeEvent>
     private let eventSink: AsyncStream<DecodeEvent>.Continuation
 
@@ -35,6 +74,7 @@ public final class VideoDecoder: @unchecked Sendable {
     private let input: Channel<Packet>
     private let output: Channel<VideoFrame>
     private let policy: HardwarePolicy
+    private let deinterlacing: Deinterlacing
 
     // Cross-thread lifecycle, guarded by `lock`.
     private let lock = NSCondition()
@@ -42,6 +82,7 @@ public final class VideoDecoder: @unchecked Sendable {
     private var finished = false
     private var stopRequested = false
     private var drainRequested = false
+    private var deinterlaceActive = false
 
     // Decode-thread-only state.
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -51,18 +92,35 @@ public final class VideoDecoder: @unchecked Sendable {
     private var consecutiveErrors = 0
     private let pixelFactory = PixelBufferFactory()
 
+    // Deinterlace state, decode-thread-only.
+    private var filterGraph: VideoFilterGraph? {
+        didSet {
+            lock.lock()
+            deinterlaceActive = filterGraph != nil
+            lock.unlock()
+        }
+    }
+    /// Set when the graph could not be built or failed mid-stream. Filtering
+    /// stops for the rest of the session; playback continues combed rather
+    /// than stopping (PLAN.md §3.3 — degrade, never crash).
+    private var filteringGivenUp = false
+    private var downloadedFrame: UnsafeMutablePointer<AVFrame>?
+    private var filteredFrame: UnsafeMutablePointer<AVFrame>?
+
     private let maxConsecutiveErrors = 100
 
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
         output: Channel<VideoFrame>,
-        policy: HardwarePolicy = .videoToolbox
+        policy: HardwarePolicy = .videoToolbox,
+        deinterlacing: Deinterlacing = Deinterlacing()
     ) {
         self.parameters = parameters
         self.input = input
         self.output = output
         self.policy = policy
+        self.deinterlacing = deinterlacing
         var continuation: AsyncStream<DecodeEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
@@ -77,6 +135,14 @@ public final class VideoDecoder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return usingHardware
+    }
+
+    /// True while frames are being routed through the deinterlacer — i.e. the
+    /// stream was found to be interlaced (or filtering was forced).
+    public var isDeinterlacing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return deinterlaceActive
     }
 
     // MARK: Control (any thread)
@@ -155,6 +221,17 @@ public final class VideoDecoder: @unchecked Sendable {
             av_frame_free(&pointer)
         }
 
+        if deinterlacing.mode != .off {
+            downloadedFrame = av_frame_alloc()
+            filteredFrame = av_frame_alloc()
+            filteringGivenUp = downloadedFrame == nil || filteredFrame == nil
+        }
+        defer {
+            filterGraph = nil
+            av_frame_free(&downloadedFrame)
+            av_frame_free(&filteredFrame)
+        }
+
         while true {
             lock.lock()
             let stop = stopRequested
@@ -181,6 +258,10 @@ public final class VideoDecoder: @unchecked Sendable {
             if let serial = currentSerial, serial != packet.serial {
                 avcodec_flush_buffers(codecContext)
                 waitingForKeyframe = false
+                // The filter holds fields from before the seek; a graph is
+                // cheap to rebuild and stale fields would be blended into the
+                // first frame at the new position.
+                filterGraph = nil
             }
             currentSerial = packet.serial
 
@@ -200,9 +281,12 @@ public final class VideoDecoder: @unchecked Sendable {
 
         var sendResult = avcodec_send_packet(context, packet.raw)
         if lume_is_eagain(sendResult) != 0 {
-            // Decoder is full: pull frames, then retry once.
+            // Decoder is full: pull frames, then retry once. Draining can
+            // rebuild the codec underneath us (a delivery failure downgrades to
+            // software), so the context is re-read rather than reused.
             receiveFrames(into: frame)
-            sendResult = avcodec_send_packet(context, packet.raw)
+            guard let retryContext = codecContext else { return }
+            sendResult = avcodec_send_packet(retryContext, packet.raw)
         }
         if sendResult < 0 && lume_is_eagain(sendResult) == 0 && lume_is_eof(sendResult) == 0 {
             handleDecodeError(sendResult)
@@ -212,8 +296,10 @@ public final class VideoDecoder: @unchecked Sendable {
     }
 
     private func receiveFrames(into frame: UnsafeMutablePointer<AVFrame>) {
-        guard let context = codecContext else { return }
-        while true {
+        // Re-read per iteration, never hoisted: delivering a frame can fail,
+        // and the hardware recovery policy frees this very context and opens a
+        // software one. A hoisted pointer would be dangling on the next pass.
+        while let context = codecContext {
             let result = avcodec_receive_frame(context, frame)
             if lume_is_eagain(result) != 0 || lume_is_eof(result) != 0 { return }
             guard result >= 0 else {
@@ -221,14 +307,141 @@ public final class VideoDecoder: @unchecked Sendable {
                 return
             }
             consecutiveErrors = 0
-            deliver(frame: frame)
+            emit(frame: frame)
             av_frame_unref(frame)
         }
     }
 
-    private func deliver(frame: UnsafeMutablePointer<AVFrame>) {
-        let pts = frame.pointee.best_effort_timestamp
-        let duration = max(frame.pointee.duration, 0)
+    // MARK: Deinterlace (decode thread only)
+
+    /// Routes one decoded frame to the renderer, through the deinterlacer when
+    /// the stream needs it.
+    private func emit(frame: UnsafeMutablePointer<AVFrame>) {
+        guard shouldDeinterlace(frame) else {
+            deliver(frame: frame, pts: frame.pointee.best_effort_timestamp, duration: frame.pointee.duration)
+            return
+        }
+        deinterlace(frame)
+    }
+
+    private func shouldDeinterlace(_ frame: UnsafeMutablePointer<AVFrame>) -> Bool {
+        guard deinterlacing.mode != .off, !filteringGivenUp else { return false }
+        if deinterlacing.mode == .always { return true }
+        // Once a stream has shown an interlaced frame, every frame keeps going
+        // through the graph: `deint=interlaced` passes progressive frames
+        // through untouched, and one path keeps the filter's temporal window
+        // continuous across the progressive splices a live broadcast is full of
+        // (the ad break in the middle of a 1080i match). A stream that is
+        // progressive throughout never builds a graph and never leaves the
+        // zero-copy path.
+        if filterGraph != nil { return true }
+        return frame.pointee.flags & AV_FRAME_FLAG_INTERLACED != 0
+    }
+
+    private func deinterlace(_ frame: UnsafeMutablePointer<AVFrame>) {
+        // The deinterlacers are software, planar-only filters, so a
+        // VideoToolbox frame has to come back to the CPU first. This is the
+        // cost of deinterlacing on the hardware path; it is still cheaper than
+        // giving up hardware decode, and it keeps the decoder's lifecycle out
+        // of it — no codec rebuild, no keyframe resync, and a stream that
+        // switches between interlaced and progressive is just data.
+        guard let software = softwarePixels(of: frame),
+              let output = filteredFrame
+        else {
+            giveUpFiltering(deliveringInstead: frame)
+            return
+        }
+
+        let format = VideoFilterGraph.SourceFormat(frame: software)
+        if filterGraph?.sourceFormat != format {
+            filterGraph = makeFilterGraph(format: format)
+        }
+        guard let graph = filterGraph else {
+            giveUpFiltering(deliveringInstead: frame)
+            return
+        }
+
+        do {
+            try graph.send(software)
+        } catch {
+            giveUpFiltering(deliveringInstead: frame)
+            return
+        }
+
+        do {
+            // A deinterlacer holds a frame back to see the next field, so an
+            // input legitimately yields zero, one, or (in field mode) two.
+            while try graph.receive(into: output) {
+                deliver(
+                    frame: output,
+                    pts: rescale(output.pointee.pts, from: graph.outputTimeBase),
+                    duration: rescale(max(output.pointee.duration, 0), from: graph.outputTimeBase)
+                )
+                av_frame_unref(output)
+            }
+        } catch {
+            av_frame_unref(output)
+            // Input was accepted, so the frame is not lost — no fallback
+            // delivery here, or it would be presented twice.
+            giveUpFiltering(deliveringInstead: nil)
+        }
+    }
+
+    /// Hardware frames are downloaded into a reusable scratch frame; software
+    /// frames are already what the filter wants.
+    private func softwarePixels(of frame: UnsafeMutablePointer<AVFrame>) -> UnsafeMutablePointer<AVFrame>? {
+        guard frame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue else { return frame }
+        guard let scratch = downloadedFrame else { return nil }
+        av_frame_unref(scratch)
+        guard av_hwframe_transfer_data(scratch, frame, 0) >= 0 else { return nil }
+        // Carries PTS, duration, field order and colour properties across the
+        // download; the filter reads the field flags to pick field parity.
+        guard av_frame_copy_props(scratch, frame) >= 0 else { return nil }
+        return scratch
+    }
+
+    private func makeFilterGraph(format: VideoFilterGraph.SourceFormat) -> VideoFilterGraph? {
+        let mode = deinterlacing.rate == .field ? "send_field" : "send_frame"
+        // `deint=interlaced` in auto mode: frames the decoder did not flag stay
+        // untouched. In `.always` the flags are what we distrust, so filter all.
+        let scope = deinterlacing.mode == .always ? "all" : "interlaced"
+        let options = "mode=\(mode):parity=auto:deint=\(scope)"
+
+        // bwdif is the better filter and ships NEON kernels; yadif is the
+        // fallback for a build that lacks it.
+        for filter in ["bwdif", "yadif"] {
+            if let graph = try? VideoFilterGraph(
+                filter: filter,
+                options: options,
+                format: format,
+                timeBase: lume_av_time_base_q()
+            ) {
+                return graph
+            }
+        }
+        return nil
+    }
+
+    /// Stops filtering for the rest of the session and, when a frame is still
+    /// in hand, presents it unfiltered.
+    private func giveUpFiltering(deliveringInstead frame: UnsafeMutablePointer<AVFrame>?) {
+        filteringGivenUp = true
+        filterGraph = nil
+        guard let frame else { return }
+        deliver(frame: frame, pts: frame.pointee.best_effort_timestamp, duration: frame.pointee.duration)
+    }
+
+    /// Filter output carries the sink's time base — a field-doubling filter
+    /// halves it — so timestamps come back to engine microseconds here.
+    private func rescale(_ value: Int64, from timeBase: AVRational) -> Int64 {
+        guard MediaTime.isValid(value) else { return value }
+        return av_rescale_q(value, timeBase, lume_av_time_base_q())
+    }
+
+    // MARK: Delivery
+
+    private func deliver(frame: UnsafeMutablePointer<AVFrame>, pts: Int64, duration: Int64) {
+        let duration = max(duration, 0)
         let serial = currentSerial ?? 0
 
         let pixelBuffer: CVPixelBuffer
@@ -261,8 +474,31 @@ public final class VideoDecoder: @unchecked Sendable {
         guard let context = codecContext else { return }
         avcodec_send_packet(context, nil)
         receiveFrames(into: frame)
-        avcodec_flush_buffers(context) // stay usable for post-EOF seeks/live resume
+        drainFilter()
+        // Same reason as in `receiveFrames`: draining may have replaced it.
+        avcodec_flush_buffers(codecContext) // stay usable for post-EOF seeks/live resume
         eventSink.yield(.endOfStream(serial: serial ?? 0))
+    }
+
+    /// Pushes the deinterlacer's held-back fields out at end of stream. The
+    /// graph is at EOF afterwards and cannot take more input, so it is dropped;
+    /// a live stream that resumes simply builds a new one.
+    private func drainFilter() {
+        guard let graph = filterGraph, let output = filteredFrame else { return }
+        filterGraph = nil
+        do {
+            try graph.flush()
+            while try graph.receive(into: output) {
+                deliver(
+                    frame: output,
+                    pts: rescale(output.pointee.pts, from: graph.outputTimeBase),
+                    duration: rescale(max(output.pointee.duration, 0), from: graph.outputTimeBase)
+                )
+                av_frame_unref(output)
+            }
+        } catch {
+            av_frame_unref(output)
+        }
     }
 
     private func handleDecodeError(_ code: Int32?, _ underlying: EngineError? = nil) {

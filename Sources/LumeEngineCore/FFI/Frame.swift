@@ -12,7 +12,9 @@ public final class VideoFrame: @unchecked Sendable {
     public let serial: UInt64
     public let width: Int
     public let height: Int
-    /// True when this frame came off the hardware (VideoToolbox) path.
+    /// True when the pixel buffer is a VideoToolbox surface handed over
+    /// zero-copy. False for anything the CPU had to write, including frames
+    /// that were hardware-decoded and then deinterlaced.
     public let isHardwareDecoded: Bool
 
     init(

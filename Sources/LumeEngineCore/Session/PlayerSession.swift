@@ -18,6 +18,10 @@ public enum PlayerEvent: Sendable {
 public struct PlayerConfiguration: Sendable {
     public var demuxer = DemuxerOptions()
     public var hardwareDecode: VideoDecoder.HardwarePolicy = .videoToolbox
+    /// Deinterlacing policy. Defaults to filtering as soon as the decoder
+    /// reports interlaced frames, at field rate — broadcast sport is the
+    /// motivating case, and untouched 1080i combs badly on fast motion.
+    public var deinterlace = VideoDecoder.Deinterlacing()
     /// Seconds of decoded media to buffer before starting/resuming playback.
     public var bufferTarget: Double = 1.0
     /// Seconds of *compressed* media the demuxer reads ahead per lane (packet
@@ -199,7 +203,13 @@ public actor PlayerSession {
             let packets = makeVideoPacketChannel()
             let frames = Channel<VideoFrame>(capacity: configuration.videoQueueDepth, measure: { max($0.duration, 0) })
             demuxer.attach(channel: packets, toStream: track.index)
-            let decoder = VideoDecoder(parameters: parameters, input: packets, output: frames, policy: configuration.hardwareDecode)
+            let decoder = VideoDecoder(
+                parameters: parameters,
+                input: packets,
+                output: frames,
+                policy: configuration.hardwareDecode,
+                deinterlacing: configuration.deinterlace
+            )
             videoPackets = packets
             videoFrames = frames
             videoDecoder = decoder
