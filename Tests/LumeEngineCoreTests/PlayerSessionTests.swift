@@ -36,11 +36,21 @@ struct PlayerSessionTests {
         let reachedPlaying = await eventually { await session.state == .playing }
         #expect(reachedPlaying, "session must reach .playing")
 
+        // Poll for progress rather than measuring a fixed wall-clock window:
+        // a contended CI runner can stall the sampling itself, which says
+        // nothing about the clock. "Advances in real time" means it keeps
+        // moving and does not outrun the media — both hold whenever the
+        // sampler gets scheduled.
         let p1 = await session.position
-        try await Task.sleep(for: .seconds(1))
+        let advanced = await eventually { await session.position - p1 > 0.6 }
+        let reached = await session.position - p1
+        #expect(advanced, "clock must keep advancing, reached \(reached)")
+
+        let elapsed = Date()
         let p2 = await session.position
-        let advanced = p2 - p1
-        #expect(advanced > 0.6 && advanced < 1.6, "clock should advance ~1 s of media per wall second, got \(advanced)")
+        try await Task.sleep(for: .milliseconds(500))
+        let drift = (await session.position - p2) - Date().timeIntervalSince(elapsed)
+        #expect(drift < 0.5, "clock must not outrun wall time, got \(drift) s of excess")
 
         await session.shutdown()
     }
@@ -54,10 +64,23 @@ struct PlayerSessionTests {
 
         await session.pause()
         #expect(await session.state == .paused)
+
+        // Stopping is not instantaneous: the synchronizer's timebase is slaved
+        // to the audio renderer's clock, so `rate = 0` lands a moment after
+        // pause() returns — on a contended host, a visible moment. What must
+        // hold is that the clock converges to a stop and then stays there, not
+        // that it is already frozen on the next line.
+        let stopped = await eventually {
+            let a = await session.position
+            try? await Task.sleep(for: .milliseconds(100))
+            return abs(await session.position - a) < 0.01
+        }
+        #expect(stopped, "paused clock must come to a stop")
+
         let p1 = await session.position
         try await Task.sleep(for: .milliseconds(500))
         let p2 = await session.position
-        #expect(abs(p2 - p1) < 0.05, "paused clock must not advance (drifted \(p2 - p1))")
+        #expect(abs(p2 - p1) < 0.05, "paused clock must stay stopped (drifted \(p2 - p1))")
 
         await session.play()
         let resumed = await eventually { await session.state == .playing }

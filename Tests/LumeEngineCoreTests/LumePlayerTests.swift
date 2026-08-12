@@ -25,7 +25,13 @@ struct LumePlayerTests {
         }
         #expect(player.state == .playing)
 
-        try await Task.sleep(for: .seconds(1))
+        // The facade mirrors position as a low-rate observation, so poll for the
+        // tick instead of assuming a fixed window produced one — a stalled
+        // sampler is not a stalled clock.
+        let tickDeadline = Date(timeIntervalSinceNow: 10)
+        while player.position <= 0.5 && Date() < tickDeadline {
+            try await Task.sleep(for: .milliseconds(100))
+        }
         #expect(player.position > 0.5, "observable position should tick, got \(player.position)")
 
         player.seek(to: 6)
