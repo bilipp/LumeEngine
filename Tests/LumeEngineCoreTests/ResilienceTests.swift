@@ -36,8 +36,9 @@ struct ResilienceTests {
         await session.play()
         let playing = await eventually { await session.state == .playing }
         #expect(playing, "HTTP playback should start")
-        try await Task.sleep(for: .milliseconds(700))
-        #expect(await session.position > 0.2)
+        let advanced = await eventually { await session.position > 0.2 }
+        let reached = await session.position
+        #expect(advanced, "clock must advance over HTTP, reached \(reached)")
         await session.shutdown()
     }
 
@@ -72,9 +73,9 @@ struct ResilienceTests {
         let playing = await eventually(timeout: 15) { await session.state == .playing }
         #expect(playing, "playback must start after the seek (no pipeline deadlock)")
         let p1 = await session.position
-        try await Task.sleep(for: .seconds(2))
+        let advanced = await eventually { await session.position > p1 + 1.0 }
         let p2 = await session.position
-        #expect(p2 > p1 + 1.0, "clock must advance after the seek, got \(p1) → \(p2)")
+        #expect(advanced, "clock must advance after the seek, got \(p1) → \(p2)")
         await session.shutdown()
     }
 
