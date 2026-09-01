@@ -212,4 +212,100 @@ struct PlayerSessionTests {
 
         await session.shutdown()
     }
+
+    // MARK: Preferred languages
+    //
+    // The selection must happen while the pipeline is built: selecting after
+    // open() routes through seek(to: position) with position still 0, which
+    // wipes a startPosition resume and seeks live sources that cannot take one.
+    // These tests therefore assert the state right after open(), before play().
+
+    private func makeLanguageSession(audioLanguages: [String] = []) -> PlayerSession {
+        var configuration = PlayerConfiguration()
+        configuration.muted = true
+        configuration.bufferTarget = 0.5
+        configuration.preferredAudioLanguages = audioLanguages
+        // What a host that wants the forced-subtitle rule sets. The rule is
+        // opt-in, so these tests have to opt in the same way Lume does.
+        configuration.autoEnableForcedSubtitlesForForeignAudio = true
+        return PlayerSession(configuration: configuration)
+    }
+
+    @Test("preferred audio language beats the container default", .timeLimit(.minutes(1)))
+    func preferredAudioLanguageWins() async throws {
+        // multilang.mkv: a:0 eng carries the default disposition, a:1 ger does not.
+        let session = makeLanguageSession(audioLanguages: ["de", "en"])
+        let info = try await session.open(url: try Fixtures.path("multilang.mkv"))
+
+        let german = try #require(info.audioTracks.first { $0.language == "ger" })
+        #expect(await session.selectedAudioTrackIndex == german.index)
+        #expect(await session.selectedSubtitleTrackIndex == nil, "subtitles must stay off")
+
+        await session.shutdown()
+    }
+
+    @Test("no preference keeps the container default", .timeLimit(.minutes(1)))
+    func noPreferenceKeepsContainerDefault() async throws {
+        let session = makeLanguageSession()
+        let info = try await session.open(url: try Fixtures.path("multilang.mkv"))
+
+        let english = try #require(info.audioTracks.first { $0.language == "eng" })
+        #expect(await session.selectedAudioTrackIndex == english.index)
+
+        await session.shutdown()
+    }
+
+    @Test("an unmatched preference is inert", .timeLimit(.minutes(1)))
+    func unmatchedPreferenceIsInert() async throws {
+        // No Japanese track: "no match" means leaving the container alone, not
+        // picking track 0 and not surfacing anything.
+        let session = makeLanguageSession(audioLanguages: ["ja"])
+        let info = try await session.open(url: try Fixtures.path("multilang.mkv"))
+
+        let english = try #require(info.audioTracks.first { $0.language == "eng" })
+        #expect(await session.selectedAudioTrackIndex == english.index)
+
+        await session.shutdown()
+    }
+
+    @Test("foreign audio auto-enables a forced subtitle track", .timeLimit(.minutes(1)))
+    func forcedSubtitlesUnderForeignAudio() async throws {
+        // forcedsubs.mkv has English audio only; a German-preferring viewer
+        // gets audio they did not ask for, so the forced track comes on.
+        let session = makeLanguageSession(audioLanguages: ["de"])
+        let info = try await session.open(url: try Fixtures.path("forcedsubs.mkv"))
+
+        let forced = try #require(info.subtitleTracks.first { $0.isForced })
+        #expect(await session.selectedSubtitleTrackIndex == forced.index)
+
+        await session.shutdown()
+    }
+
+    @Test("foreign audio never enables a non-forced subtitle track", .timeLimit(.minutes(1)))
+    func foreignAudioLeavesFullSubtitleTracksOff() async throws {
+        // multitrack.mkv is eng+ger audio with a plain (non-forced) eng SRT.
+        // A Japanese-preferring viewer gets foreign audio, but only a forced
+        // track is ever switched on for them — a full track stays the app's
+        // call, made through selectSubtitleTrack(_:).
+        let session = makeLanguageSession(audioLanguages: ["ja"])
+        _ = try await session.open(url: try Fixtures.path("multitrack.mkv"))
+        #expect(await session.selectedSubtitleTrackIndex == nil, "only forced tracks are ever auto-enabled")
+        await session.shutdown()
+    }
+
+    @Test("matching audio leaves forced subtitles off", .timeLimit(.minutes(1)))
+    func forcedSubtitlesStayOffWhenAudioMatches() async throws {
+        let session = makeLanguageSession(audioLanguages: ["en"])
+        _ = try await session.open(url: try Fixtures.path("forcedsubs.mkv"))
+        #expect(await session.selectedSubtitleTrackIndex == nil)
+        await session.shutdown()
+    }
+
+    @Test("default configuration never reaches the forced branch", .timeLimit(.minutes(1)))
+    func forcedSubtitlesUnreachableWithoutPreferences() async throws {
+        let session = makeLanguageSession()
+        _ = try await session.open(url: try Fixtures.path("forcedsubs.mkv"))
+        #expect(await session.selectedSubtitleTrackIndex == nil, "empty preferences must behave exactly as before")
+        await session.shutdown()
+    }
 }
