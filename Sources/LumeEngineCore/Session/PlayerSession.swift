@@ -47,6 +47,26 @@ public struct PlayerConfiguration: Sendable {
     public var enableVideo = true
     public var enableAudio = true
     public var muted = false
+    /// Ordered, ALREADY-NORMALISED bare language tags supplied by the caller
+    /// (`["de", "en"]`); empty means use the container default.
+    ///
+    /// The engine does no normalisation of its own — it never reads the device
+    /// locale and never invents a preference — but it does normalise the
+    /// *container's* tags, which arrive as ISO 639-2/B (`ger`), /T (`deu`),
+    /// 639-1, or a regional variant (`de-AT`). Applied while the pipeline is
+    /// built, before the demuxer streams a byte (see `TrackLanguageMatcher`).
+    ///
+    /// Also ranks the forced subtitle track when
+    /// `autoEnableForcedSubtitlesForForeignAudio` is on.
+    public var preferredAudioLanguages: [String] = []
+    /// Turn a forced subtitle track on by itself when the audio that ends up
+    /// selected matches none of `preferredAudioLanguages`.
+    ///
+    /// Off by default: whether untranslated dialogue should be subtitled is a
+    /// viewer-facing policy the host owns. The mechanism lives here because it
+    /// has to run while the pipeline is built — attaching the lane after
+    /// `open()` would miss cues and route through a seek.
+    public var autoEnableForcedSubtitlesForForeignAudio = false
     /// Seconds without clock progress (while expected) before `.stalled` fires.
     public var stallThreshold: Double = 8
 
@@ -183,12 +203,20 @@ public actor PlayerSession {
         guard let demuxer else { throw EngineError(code: .invalidState, message: "no demuxer") }
         self.info = info
 
-        // Default track selection: container default flag, else first of kind.
+        // Track selection: the app's ordered language preference first, then
+        // the container default flag, then the first track of the kind. The
+        // preference is resolved *here*, while the pipeline is being built —
+        // selecting after open would route through `seek(to: position)` with
+        // position still 0, discarding `startPosition` on VOD resume and
+        // seeking live sources that do not survive one (see
+        // `TrackLanguageMatcher`). An empty preference list matches nothing,
+        // so a default configuration behaves exactly as it did before.
         let videoTrack = configuration.enableVideo
             ? info.videoTracks.first(where: \.isDefault) ?? info.videoTracks.first
             : nil
         let audioTrack = configuration.enableAudio
-            ? info.audioTracks.first(where: \.isDefault) ?? info.audioTracks.first
+            ? TrackLanguageMatcher.bestMatch(in: info.audioTracks, preferring: configuration.preferredAudioLanguages)
+            ?? info.audioTracks.first(where: \.isDefault) ?? info.audioTracks.first
             : nil
 
         guard videoTrack != nil || audioTrack != nil else {
@@ -240,6 +268,26 @@ public actor PlayerSession {
             decoder.start()
         }
 
+        // The one case where the engine turns subtitles on by itself, and only
+        // when the host asked for it: the audio the viewer will hear is foreign
+        // to them (it matched none of their preferred audio languages) and the
+        // source carries a forced track for the untranslated dialogue.
+        // Attaching here rather than after open keeps it on the same no-seek
+        // path as the audio choice, and the demuxer has not read a packet yet,
+        // so no cue is missed.
+        if configuration.autoEnableForcedSubtitlesForForeignAudio,
+           let audioTrack,
+           !configuration.preferredAudioLanguages.isEmpty,
+           !TrackLanguageMatcher.matches(audioTrack, preferring: configuration.preferredAudioLanguages),
+           let forced = forcedSubtitleTrack(in: info),
+           let parameters = demuxer.codecParameters(forStream: forced.index) {
+            let packets = Channel<Packet>(capacity: 128)
+            demuxer.attach(channel: packets, toStream: forced.index)
+            let decoder = SubtitleDecoder(parameters: parameters, input: packets, store: subtitles)
+            installSubtitleLane(trackIndex: forced.index, packets: packets, decoder: decoder)
+            decoder.start()
+        }
+
         renderer.onRenderFailure = { [weak self] error in
             guard let self else { return }
             Task { await self.handleRenderFailure(error) }
@@ -261,6 +309,18 @@ public actor PlayerSession {
         monitorTask = Task {
             await self.monitorLoop()
         }
+    }
+
+    /// The forced track to show under foreign audio, ranked by the viewer's
+    /// audio preference (someone who wants German audio reads German signs)
+    /// and otherwise whatever forced track exists — a forced track is short,
+    /// on-screen only for dialogue the soundtrack leaves untranslated, and is
+    /// what the mux author expected to be shown.
+    private func forcedSubtitleTrack(in info: MediaInfo) -> TrackInfo? {
+        let forced = info.subtitleTracks.filter(\.isForced)
+        guard !forced.isEmpty else { return nil }
+        return TrackLanguageMatcher.bestMatch(in: forced, preferring: configuration.preferredAudioLanguages)
+            ?? forced.first
     }
 
     /// Timeline origin: media start time plus any requested start position.

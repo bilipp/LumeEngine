@@ -6,6 +6,8 @@
 #   basic.mp4      — H.264 + AAC, 10 s VOD
 #   wrap.ts        — MPEG-TS whose raw 33-bit timestamps wrap mid-file
 #   multitrack.mkv — video + 2 audio languages + SRT subtitles + chapters
+#   multilang.mkv  — video + eng (default disposition) + ger audio
+#   forcedsubs.mkv — video + eng audio + a FORCED eng subtitle track
 #   surround71.mkv — FLAC 7.1 audio-only
 #   truehd.mkv     — TrueHD 5.1 audio-only (40-sample access units)
 #   interlaced.ts  — 1080i-style MPEG-TS, field-coded, TFF (deinterlacer input)
@@ -69,6 +71,41 @@ gen interlaced.ts \
     -f lavfi -i "testsrc2=duration=4:size=640x360:rate=50" \
     -vf "interlace=scan=tff" \
     -c:v mpeg2video -flags +ilme+ildct -top 1 -g 25 -f mpegts
+
+# Two audio languages where the container's own default flag (eng) is the
+# *wrong* answer for a German-preferring viewer: the ordered preference must
+# beat the disposition, and an empty/unmatched preference must leave it alone.
+gen multilang.mkv \
+    -f lavfi -i "testsrc2=duration=5:size=320x180:rate=25" \
+    -f lavfi -i "sine=frequency=440:duration=5" \
+    -f lavfi -i "sine=frequency=880:duration=5" \
+    -map 0:v -map 1:a -map 2:a \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=ger \
+    -disposition:a:0 default -f matroska
+
+# A forced subtitle track under English-only audio: the one case where the
+# engine enables subtitles by itself (viewer prefers another audio language,
+# so the dialogue they get is foreign and the signs/foreign-speech track is
+# what the mux author meant them to see).
+if [ ! -f "$OUT/forcedsubs.mkv" ]; then
+    cat > "$OUT/forced.srt" <<'SRT'
+1
+00:00:01,000 --> 00:00:03,000
+[speaking another language]
+SRT
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=5:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=5" \
+        -i "$OUT/forced.srt" \
+        -map 0:v -map 1:a -map 2:s \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+        -c:a aac -c:s srt \
+        -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng \
+        -disposition:s:0 forced \
+        "$OUT/forcedsubs.mkv"
+    echo "generated: $OUT/forcedsubs.mkv"
+fi
 
 if [ ! -f "$OUT/multitrack.mkv" ]; then
     cat > "$OUT/subs.srt" <<'SRT'
