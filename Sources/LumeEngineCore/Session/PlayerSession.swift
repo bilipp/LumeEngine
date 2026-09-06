@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Events surfaced to the app layer (PLAN.md D8 — typed events, no delegates).
 public enum PlayerEvent: Sendable {
@@ -22,6 +23,24 @@ public struct PlayerConfiguration: Sendable {
     /// reports interlaced frames, at field rate — broadcast sport is the
     /// motivating case, and untouched 1080i combs badly on fast motion.
     public var deinterlace = VideoDecoder.Deinterlacing()
+    /// Tag CPU-produced pixel buffers with the colour the source declares —
+    /// primaries, transfer function, YCbCr matrix, and the ST 2086 /
+    /// CTA-861.3 static HDR payloads when the stream carries them — so the
+    /// `CMSampleBuffer` the renderer enqueues describes its own colour
+    /// correctly. Without it HDR10/HLG (and Dolby Vision profile 8.1, whose
+    /// base layer is HDR10) renders washed out on any path the CPU touched,
+    /// which includes the deinterlacer — on by default, and it downloads
+    /// hardware frames to the CPU.
+    ///
+    /// Only ever attaches what the source actually declares:
+    /// `AVCOL_*_UNSPECIFIED` yields no attachment at all, never a guessed
+    /// default, so ordinary untagged SD/IPTV channels keep rendering exactly
+    /// as they do today. VideoToolbox's own zero-copy surfaces are never
+    /// touched either way — they arrive correctly tagged.
+    ///
+    /// On by default; off is the escape hatch for a display that mishandles a
+    /// correct tag.
+    public var preservesHDRMetadata = true
     /// Seconds of decoded media to buffer before starting/resuming playback.
     public var bufferTarget: Double = 1.0
     /// Seconds of *compressed* media the demuxer reads ahead per lane (packet
@@ -47,6 +66,33 @@ public struct PlayerConfiguration: Sendable {
     public var enableVideo = true
     public var enableAudio = true
     public var muted = false
+    /// Channel width the decoded audio is downmixed to, stated by the host.
+    /// `nil` (the default) keeps the engine's own resolution
+    /// (`AudioDecoder.defaultMaxOutputChannels()`), so every existing caller
+    /// behaves exactly as before.
+    ///
+    /// This must be the **negotiated** output width, not the route's
+    /// capability. `AVAudioSession.maximumOutputNumberOfChannels` reports what
+    /// the hardware *could* carry (8 over HDMI) — passing that through is a
+    /// bug: feeding the renderer more channels than the session actually
+    /// outputs fails it outright (silence, wedged pipeline). Pass what the
+    /// session reports *after* activating it with a matching
+    /// `preferredOutputNumberOfChannels`; over-shooting is worse than
+    /// downmixing.
+    ///
+    /// It exists because the engine cannot close the ordering race from its
+    /// side: `defaultMaxOutputChannels()` reads the session at lane-build
+    /// time, while an app typically widens the session from a later SwiftUI
+    /// `.task`, and a session opens exactly one URL with no rebuild-in-place
+    /// (PLAN.md §3.1). Configuring the audio session for surround stays the
+    /// app's job (PLAN.md §2.1); this is how it tells the engine the outcome.
+    ///
+    /// Applied at every audio-lane construction — the initial lane and a
+    /// mid-session track switch alike — so a track change cannot silently
+    /// revert to the session-read width. On macOS, where there is no
+    /// `AVAudioSession` and the fallback is a flat 2, an explicit value here
+    /// is the only way to reach a multichannel interface.
+    public var maxOutputChannels: Int?
     /// Ordered, ALREADY-NORMALISED bare language tags supplied by the caller
     /// (`["de", "en"]`); empty means use the container default.
     ///
@@ -226,6 +272,10 @@ public actor PlayerSession {
         selectedVideoTrackIndex = videoTrack?.index
         selectedAudioTrackIndex = audioTrack?.index
 
+        // Once per stream open, never per tick (PLAN.md §3.6 — diagnostics
+        // only; nothing downstream reads this back).
+        logStreamOpen(info: info, video: videoTrack, audio: audioTrack)
+
         if let track = videoTrack,
            let parameters = demuxer.codecParameters(forStream: track.index) {
             let packets = makeVideoPacketChannel()
@@ -236,7 +286,8 @@ public actor PlayerSession {
                 input: packets,
                 output: frames,
                 policy: configuration.hardwareDecode,
-                deinterlacing: configuration.deinterlace
+                deinterlacing: configuration.deinterlace,
+                preservesHDRMetadata: configuration.preservesHDRMetadata
             )
             videoPackets = packets
             videoFrames = frames
@@ -255,7 +306,12 @@ public actor PlayerSession {
             let packets = makeAudioPacketChannel()
             let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
             demuxer.attach(channel: packets, toStream: track.index)
-            let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
+            let decoder = AudioDecoder(
+                parameters: parameters,
+                input: packets,
+                output: frames,
+                maxOutputChannels: configuration.maxOutputChannels
+            )
             audioPackets = packets
             audioFrames = frames
             audioDecoder = decoder
@@ -328,6 +384,53 @@ public actor PlayerSession {
         info?.startTime ?? 0
     }
 
+    /// One structured line per stream open, describing what the *container*
+    /// declared — the source-signalling half of the comparison whose CoreVideo
+    /// half `VideoDecoder.logColorHandling` writes on the first delivered
+    /// frame. Detection only: nothing here changes how a frame is rendered.
+    private func logStreamOpen(info: MediaInfo, video: TrackInfo?, audio: TrackInfo?) {
+        var message = "stream-open format=\(info.formatName)"
+            + " live=\(info.isLive ? "yes" : "no")"
+            + " tracks=\(info.tracks.count)"
+
+        if let video, let properties = video.video {
+            message += " | video codec=\(video.codecName)"
+                + " \(properties.width)x\(properties.height)@\(String(format: "%.3f", properties.fps))"
+                + " depth=\(properties.bitDepth)"
+                + " pixfmt=\(properties.pixelFormatName ?? "unknown")"
+                + " hdr=\(properties.isHDR ? "yes" : "no")"
+                + " primaries=\(properties.colorPrimaries)"
+                + " transfer=\(properties.colorTransfer)"
+                + " matrix=\(properties.colorSpace)"
+                + " range=\(properties.colorRangeFull ? "full" : "limited")"
+                + " dolbyVision=\(Self.describe(properties.dolbyVision))"
+        } else {
+            message += " | video none"
+        }
+
+        if let audio, let properties = audio.audio {
+            message += " | audio codec=\(audio.codecName)"
+                + " profile=\(properties.profile)"
+                + " \(properties.channels)ch/\(properties.channelLayoutName ?? "unknown")"
+                + "@\(properties.sampleRate)Hz"
+                + " objectAudio=\(properties.isObjectAudio ? "yes" : "no")"
+        } else {
+            message += " | audio none"
+        }
+
+        FFmpegRuntime.diagnostics.notice("\(message, privacy: .public)")
+    }
+
+    /// `P8.1/L9 bl=1 rpu=yes` — compact enough to sit in a heartbeat line.
+    /// `none` when the container declares no Dolby Vision configuration.
+    static func describe(_ dolbyVision: TrackInfo.DolbyVision?) -> String {
+        guard let dolbyVision else { return "none" }
+        return "P\(dolbyVision.profile).\(dolbyVision.blCompatibilityID)"
+            + "/L\(dolbyVision.level)"
+            + " bl=\(dolbyVision.hasBaseLayer ? "yes" : "no")"
+            + " rpu=\(dolbyVision.hasRPU ? "yes" : "no")"
+    }
+
     // MARK: Transport
 
     public func play() {
@@ -387,6 +490,19 @@ public actor PlayerSession {
         /// Total compressed bytes demuxed — diff across heartbeats for the
         /// effective delivery rate.
         public let deliveredBytes: Int64
+        /// Dolby Vision configuration declared by the container for the
+        /// *selected* video track, or `nil` when there is none. Description
+        /// only — the engine forwards no RPU metadata (PLAN.md §7).
+        public let dolbyVision: TrackInfo.DolbyVision?
+        /// Raw `AVCodecParameters.profile` of the selected audio track.
+        public let audioProfile: Int32?
+        /// The selected audio track declares Dolby Atmos object audio (E-AC-3
+        /// JOC or TrueHD + Atmos). The engine still decodes it to its channel
+        /// bed and never bitstreams it (PLAN.md §7) — this reports what the
+        /// source *is*, not what the output carries.
+        public let audioIsObjectAudio: Bool
+        /// FFmpeg's formal name for the selected audio track's source layout.
+        public let audioChannelLayoutName: String?
 
         public var description: String {
             func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
@@ -400,7 +516,7 @@ public actor PlayerSession {
             var health = "v\(rendererHealth.videoStatus) a\(rendererHealth.audioStatus)"
             if let error = rendererHealth.videoError { health += " vErr(\(error))" }
             if let error = rendererHealth.audioError { health += " aErr(\(error))" }
-            return String(
+            var line = String(
                 format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB",
                 state, playheadSeconds,
                 lane(videoQueue, lead: videoLeadSeconds, first: videoFirstSeconds),
@@ -410,6 +526,18 @@ public actor PlayerSession {
                 health, demuxAtEOF ? "yes" : "no",
                 Double(deliveredBytes) / 1_048_576
             )
+            // Appended only when the source actually declares them, so an
+            // ordinary SDR/stereo heartbeat line stays the length it was.
+            if dolbyVision != nil {
+                line += " dv=\(PlayerSession.describe(dolbyVision))"
+            }
+            if audioIsObjectAudio {
+                line += " objectAudio=yes"
+            }
+            if let audioChannelLayoutName {
+                line += " alayout=\(audioChannelLayoutName)"
+            }
+            return line
         }
     }
 
@@ -438,8 +566,24 @@ public actor PlayerSession {
             audioFirstSeconds: MediaTime.isValid(lowWater.audio) ? MediaTime.seconds(lowWater.audio) : -1,
             rendererHealth: renderer.rendererHealth,
             demuxAtEOF: demuxAtEOF,
-            deliveredBytes: demuxer?.deliveredBytes ?? 0
+            deliveredBytes: demuxer?.deliveredBytes ?? 0,
+            dolbyVision: selectedVideoTrack?.video?.dolbyVision,
+            audioProfile: selectedAudioTrack?.audio?.profile,
+            audioIsObjectAudio: selectedAudioTrack?.audio?.isObjectAudio ?? false,
+            audioChannelLayoutName: selectedAudioTrack?.audio?.channelLayoutName
         )
+    }
+
+    /// The track the pipeline is actually decoding, not merely the first of
+    /// its kind — a mid-session audio switch has to move these with it.
+    private var selectedVideoTrack: TrackInfo? {
+        guard let index = selectedVideoTrackIndex else { return nil }
+        return info?.tracks.first { $0.index == index }
+    }
+
+    private var selectedAudioTrack: TrackInfo? {
+        guard let index = selectedAudioTrackIndex else { return nil }
+        return info?.tracks.first { $0.index == index }
     }
 
     // MARK: Seek
@@ -527,7 +671,12 @@ public actor PlayerSession {
         let packets = makeAudioPacketChannel()
         let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
         demuxer.attach(channel: packets, toStream: trackIndex)
-        let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
+        let decoder = AudioDecoder(
+            parameters: parameters,
+            input: packets,
+            output: frames,
+            maxOutputChannels: configuration.maxOutputChannels
+        )
         audioPackets = packets
         audioFrames = frames
         audioDecoder = decoder

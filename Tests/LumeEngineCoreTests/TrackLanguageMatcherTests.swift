@@ -22,7 +22,10 @@ struct TrackLanguageMatcherTests {
             isForced: isForced,
             bitrate: 0,
             video: nil,
-            audio: TrackInfo.Audio(channels: 2, sampleRate: 48_000),
+            audio: TrackInfo.Audio(
+                channels: 2, sampleRate: 48_000,
+                profile: -99, isObjectAudio: false, channelLayoutName: "stereo"
+            ),
             wrapBits: 64
         )
     }

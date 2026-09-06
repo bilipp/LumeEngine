@@ -3,6 +3,7 @@ internal import CFFmpeg
 import AVFAudio
 #endif
 import Foundation
+import os
 
 /// FFmpeg audio decode + resample stage: `Channel<Packet>` in,
 /// `Channel<AudioFrame>` out.
@@ -60,10 +61,16 @@ public final class AudioDecoder: @unchecked Sendable {
 
     private let maxConsecutiveErrors = 100
     private let maxOutputChannels: Int
+    /// Whether `maxOutputChannels` came from the caller (`PlayerConfiguration`
+    /// or a test) rather than from `defaultMaxOutputChannels()`. Diagnostics
+    /// only — it is what makes the `audio-width` line readable when the app
+    /// and the audio session disagree.
+    private let outputWidthWasConfigured: Bool
 
-    /// Channel budget of the current output route. The renderer downstream
-    /// cannot correctly render more channels than the route carries, so
-    /// anything beyond this is downmixed in swresample.
+    /// Channel budget of the current output route, used when the caller states
+    /// no width. The renderer downstream cannot correctly render more channels
+    /// than the route carries, so anything beyond this is downmixed in
+    /// swresample.
     ///
     /// This must be the *negotiated* output width, not the route's capability:
     /// `maximumOutputNumberOfChannels` reports what the hardware could carry
@@ -72,35 +79,98 @@ public final class AudioDecoder: @unchecked Sendable {
     /// Feeding the renderer more channels than the session actually outputs
     /// fails the renderer outright (silence, wedged pipeline) — configuring
     /// the session for surround is the app's job (PLAN.md §2.1), the engine
-    /// just honors whatever was negotiated at session-creation time.
+    /// just honors whatever was negotiated at session-creation time. That is
+    /// also why an app must never pipe `maximumOutputNumberOfChannels` into
+    /// `PlayerConfiguration.maxOutputChannels`.
+    ///
+    /// Reading the session here is inherently racy: the app may only widen it
+    /// from a later SwiftUI `.task`, by which time this lane is already built
+    /// and the session opens exactly once (PLAN.md §3.1 — no rebuild-in-place).
+    /// `PlayerConfiguration.maxOutputChannels` is the race-free alternative:
+    /// the app states the width it negotiated, and it wins on every platform,
+    /// macOS included.
     public static func defaultMaxOutputChannels() -> Int {
         #if canImport(UIKit)
         return max(2, AVAudioSession.sharedInstance().outputNumberOfChannels)
         #else
         // No AVAudioSession on macOS; default output is overwhelmingly 2ch
-        // (built-in speakers, headphones). Pass an explicit limit for
-        // multichannel interfaces.
+        // (built-in speakers, headphones). Querying CoreAudio for the real
+        // device width is the host's job — it passes the answer in as
+        // `PlayerConfiguration.maxOutputChannels`, which overrides this.
         return 2
         #endif
     }
 
+    /// - Parameter maxOutputChannels: the negotiated output width, or `nil` to
+    ///   fall back to `defaultMaxOutputChannels()`. `nil` reproduces the
+    ///   pre-configuration behaviour exactly.
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
         output: Channel<AudioFrame>,
-        maxOutputChannels: Int = AudioDecoder.defaultMaxOutputChannels()
+        maxOutputChannels: Int? = nil
     ) {
         self.parameters = parameters
         self.input = input
         self.output = output
-        self.maxOutputChannels = max(1, maxOutputChannels)
+        outputWidthWasConfigured = maxOutputChannels != nil
+        self.maxOutputChannels = max(1, maxOutputChannels ?? AudioDecoder.defaultMaxOutputChannels())
         var continuation: AsyncStream<DecodeEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
+        logResolvedOutputWidth()
     }
 
     deinit {
         eventSink.finish()
+    }
+
+    /// Logs the *resolved* output width against what the source declares and
+    /// what the audio session reports, once per decoder.
+    ///
+    /// This lives in `init` rather than at the call sites on purpose: audio
+    /// lanes are built from three places (`PlayerSession.buildPipeline`,
+    /// `PlayerSession.replaceAudioLane` on a mid-session track switch, and
+    /// tests), and a decision taken at one site silently reverts at another.
+    /// One line here cannot drift out of sync with a fourth site.
+    ///
+    /// `widthSource` says which of the two resolutions produced the number:
+    /// `configured` (the host stated the width it negotiated, via
+    /// `PlayerConfiguration.maxOutputChannels`) or `session`
+    /// (`defaultMaxOutputChannels()`). The distinction is the whole point of
+    /// the line — the session path carries an ordering race, because it reads
+    /// `AVAudioSession.outputNumberOfChannels` at lane-build time while the
+    /// app may only widen the session from a later SwiftUI `.task`.
+    ///
+    /// `sessionOutput` is logged next to the resolved value so that race is
+    /// readable: on `widthSource=session` the two numbers disagreeing (or a
+    /// track switch seconds later logging a wider value than the open did) is
+    /// the race itself; on `widthSource=configured` a disagreement means the
+    /// host stated a width the session never actually negotiated, which is the
+    /// over-shoot that wedges the renderer.
+    private func logResolvedOutputWidth() {
+        let layout = parameters.channelLayoutName ?? "unknown"
+        var message = "audio-width codec=\(parameters.codecName)"
+            + " profile=\(parameters.profile)"
+            + " source=\(parameters.channelCount)ch/\(layout)@\(parameters.sampleRate)Hz"
+            + " resolvedMaxOutputChannels=\(maxOutputChannels)"
+            + " widthSource=\(outputWidthWasConfigured ? "configured" : "session")"
+        #if canImport(UIKit)
+        let session = AVAudioSession.sharedInstance()
+        // The route is what makes this line self-contained: a `sessionMax=2`
+        // on `Speaker` is simply the truth, while the same value on `HDMIOutput`
+        // means the session was never widened. Without it the reader has to
+        // correlate against the app's own route log to tell those apart.
+        let route = session.currentRoute.outputs
+            .map { "\($0.portType.rawValue)(\($0.channels?.count ?? 0)ch)" }
+            .joined(separator: "+")
+        message += " sessionOutput=\(session.outputNumberOfChannels)"
+            + " sessionMax=\(session.maximumOutputNumberOfChannels)"
+            + " route=\(route.isEmpty ? "none" : route)"
+        #else
+        message += " sessionOutput=n/a"
+        #endif
+        FFmpegRuntime.diagnostics.notice("\(message, privacy: .public)")
     }
 
     // MARK: Control (any thread)

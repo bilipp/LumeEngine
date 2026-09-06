@@ -117,7 +117,32 @@ extension TrackInfo {
                 }
             }
 
-            let isHDR = par.color_trc == AVCOL_TRC_SMPTE2084 || par.color_trc == AVCOL_TRC_ARIB_STD_B67
+            // Dolby Vision is declared by the container (mp4 `dvcC`/`dvvC`,
+            // MPEG-TS DOVI descriptor), which libavformat surfaces as coded
+            // side data — same shape as the display matrix above.
+            var dolbyVision: DolbyVision?
+            if let sideData = av_packet_side_data_get(
+                par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_DOVI_CONF
+            ), let data = sideData.pointee.data,
+               sideData.pointee.size >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size {
+                // All-uint8_t record: alignment 1, so rebinding is safe.
+                let record = data.withMemoryRebound(
+                    to: AVDOVIDecoderConfigurationRecord.self, capacity: 1
+                ) { $0.pointee }
+                dolbyVision = DolbyVision(
+                    profile: Int(record.dv_profile),
+                    level: Int(record.dv_level),
+                    blCompatibilityID: Int(record.dv_bl_signal_compatibility_id),
+                    hasRPU: record.rpu_present_flag != 0,
+                    hasBaseLayer: record.bl_present_flag != 0
+                )
+            }
+
+            // Profile-5 streams routinely leave color_trc unspecified, so the
+            // DV declaration is a third way to know the stream is HDR.
+            let isHDR = par.color_trc == AVCOL_TRC_SMPTE2084
+                || par.color_trc == AVCOL_TRC_ARIB_STD_B67
+                || dolbyVision != nil
 
             video = Video(
                 width: Int(par.width),
@@ -130,7 +155,8 @@ extension TrackInfo {
                 colorPrimaries: par.color_primaries.rawValue,
                 colorTransfer: par.color_trc.rawValue,
                 colorSpace: par.color_space.rawValue,
-                colorRangeFull: par.color_range == AVCOL_RANGE_JPEG
+                colorRangeFull: par.color_range == AVCOL_RANGE_JPEG,
+                dolbyVision: dolbyVision
             )
         } else {
             video = nil
@@ -139,10 +165,49 @@ extension TrackInfo {
         if par.codec_type == AVMEDIA_TYPE_AUDIO {
             audio = Audio(
                 channels: Int(par.ch_layout.nb_channels),
-                sampleRate: Int(par.sample_rate)
+                sampleRate: Int(par.sample_rate),
+                profile: par.profile,
+                isObjectAudio: Self.declaresObjectAudio(codecName: codecName, profile: par.profile),
+                channelLayoutName: Self.channelLayoutName(par.ch_layout)
             )
         } else {
             audio = nil
         }
+    }
+
+    /// True when a codec+profile pair declares Dolby Atmos object audio: E-AC-3
+    /// with the JOC profile, or TrueHD with the Atmos profile.
+    ///
+    /// The gate on the codec is the whole point. `AV_PROFILE_EAC3_DDP_ATMOS`
+    /// and `AV_PROFILE_TRUEHD_ATMOS` are *both* the number 30, and 30 is a
+    /// perfectly ordinary profile elsewhere — DTS-ES is 30 — so comparing the
+    /// profile alone would label unrelated tracks as Atmos.
+    ///
+    /// Keyed on FFmpeg's canonical codec name rather than `AVCodecID` so the
+    /// gate is unit-testable: `CFFmpeg` is an `internal import`, so the enum
+    /// cases are not nameable from the test target, while the two names here
+    /// are stable FFmpeg API (`avcodec_get_name`).
+    static func declaresObjectAudio(codecName: String, profile: Int32) -> Bool {
+        switch codecName {
+        case "eac3": profile == AV_PROFILE_EAC3_DDP_ATMOS
+        case "truehd": profile == AV_PROFILE_TRUEHD_ATMOS
+        default: false
+        }
+    }
+
+    /// FFmpeg's formal name for a channel layout ("5.1(side)", "7.1", …).
+    /// `nil` when the layout is unset or the description fails.
+    private static func channelLayoutName(_ layout: AVChannelLayout) -> String? {
+        var layout = layout
+        let capacity = 128
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: capacity)
+        defer { buffer.deallocate() }
+        buffer.initialize(repeating: 0, count: capacity)
+        let written = withUnsafePointer(to: &layout) { pointer in
+            av_channel_layout_describe(pointer, buffer, capacity)
+        }
+        guard written > 0 else { return nil }
+        let name = String(cString: buffer)
+        return name.isEmpty ? nil : name
     }
 }
