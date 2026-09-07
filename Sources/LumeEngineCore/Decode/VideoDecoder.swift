@@ -1,6 +1,7 @@
 internal import CFFmpeg
 import CoreVideo
 import Foundation
+import os
 
 /// Events emitted by decoders on their own threads.
 public enum DecodeEvent: Sendable {
@@ -83,6 +84,7 @@ public final class VideoDecoder: @unchecked Sendable {
     private var stopRequested = false
     private var drainRequested = false
     private var deinterlaceActive = false
+    private var colorLogCount = 0
 
     // Decode-thread-only state.
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -90,7 +92,7 @@ public final class VideoDecoder: @unchecked Sendable {
     private var currentSerial: UInt64?
     private var waitingForKeyframe = false
     private var consecutiveErrors = 0
-    private let pixelFactory = PixelBufferFactory()
+    private let pixelFactory: PixelBufferFactory
 
     // Deinterlace state, decode-thread-only.
     private var filterGraph: VideoFilterGraph? {
@@ -109,18 +111,28 @@ public final class VideoDecoder: @unchecked Sendable {
 
     private let maxConsecutiveErrors = 100
 
+    /// Signature of the last frame whose colour handling was logged. Rebuilt
+    /// and compared on every delivered frame — eight integer reads, no
+    /// allocation, no formatting — so the log line below is written exactly
+    /// once per stream and again only when the delivered format genuinely
+    /// changes: a hardware to software downgrade, a resolution change on a
+    /// live splice, or the deinterlacer engaging. See `FFmpegRuntime.diagnostics`.
+    private var loggedColorSignature: ColorSignature?
+
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
         output: Channel<VideoFrame>,
         policy: HardwarePolicy = .videoToolbox,
-        deinterlacing: Deinterlacing = Deinterlacing()
+        deinterlacing: Deinterlacing = Deinterlacing(),
+        preservesHDRMetadata: Bool = true
     ) {
         self.parameters = parameters
         self.input = input
         self.output = output
         self.policy = policy
         self.deinterlacing = deinterlacing
+        pixelFactory = PixelBufferFactory(attachesColorMetadata: preservesHDRMetadata)
         var continuation: AsyncStream<DecodeEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
@@ -128,6 +140,18 @@ public final class VideoDecoder: @unchecked Sendable {
 
     deinit {
         eventSink.finish()
+    }
+
+    /// How many colour-handling lines this decoder has written. One per
+    /// stream, plus one per genuine format change — the invariant the
+    /// diagnostics rest on, and the reason it is observable at all: a
+    /// regression that logs per frame is otherwise invisible until it shows up
+    /// as a dropped-frame report. Guarded by `lock` (taken only when a line is
+    /// actually emitted, never per frame).
+    var colorDiagnosticsCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return colorLogCount
     }
 
     /// True when frames are currently produced by VideoToolbox.
@@ -444,19 +468,46 @@ public final class VideoDecoder: @unchecked Sendable {
         let duration = max(duration, 0)
         let serial = currentSerial ?? 0
 
+        // Read off the frame that is actually being delivered — on the
+        // deinterlaced path that is the filter's output, so this is what the
+        // filter produced rather than what went in.
+        let colorimetry = VideoColorimetry(frame: frame)
+
         let pixelBuffer: CVPixelBuffer
         let hardware = frame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue
         if hardware {
             guard let opaque = frame.pointee.data.3 else { return }
             // +0 borrow; storing into VideoFrame retains it before av_frame_unref.
+            // Handed on untouched: VideoToolbox already tagged this surface from
+            // the bitstream VUI (measured on an Apple TV 4K against a DV P8.1
+            // title — all three colour keys present and the picture clean), so
+            // re-stamping it could only make a working path worse.
             pixelBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(opaque)).takeUnretainedValue()
         } else {
             do {
-                pixelBuffer = try pixelFactory.makePixelBuffer(from: frame)
+                pixelBuffer = try pixelFactory.makePixelBuffer(from: frame, colorimetry: colorimetry)
             } catch {
                 handleDecodeError(nil, error as? EngineError)
                 return
             }
+        }
+
+        // Which of the three paths produced this buffer is the whole point of
+        // the readout below: they attach (or fail to attach) colour metadata
+        // differently, and the deinterlaced path is the ordinary one for
+        // European broadcast, not an exotic case.
+        let path: DeliveryPath
+        if hardware {
+            path = .videoToolbox
+        } else if frame == filteredFrame {
+            path = .deinterlaced
+        } else {
+            path = .software
+        }
+        let signature = ColorSignature(path: path, hardwareAccelerated: usingHardware, frame: frame)
+        if loggedColorSignature != signature {
+            loggedColorSignature = signature
+            logColorHandling(signature: signature, frame: frame, pixelBuffer: pixelBuffer)
         }
 
         let videoFrame = VideoFrame(
@@ -464,7 +515,8 @@ public final class VideoDecoder: @unchecked Sendable {
             pts: pts,
             duration: duration,
             serial: serial,
-            isHardwareDecoded: hardware
+            isHardwareDecoded: hardware,
+            colorimetry: colorimetry
         )
         // Blocking send = backpressure; closed output (teardown) just drops.
         try? output.send(videoFrame)
@@ -528,6 +580,178 @@ public final class VideoDecoder: @unchecked Sendable {
             stopRequested = true
             lock.unlock()
         }
+    }
+
+    // MARK: Colour diagnostics (decode thread only)
+
+    /// Which stage handed the pixel buffer over. The engine attaches no colour
+    /// metadata of its own today, so what CoreVideo ends up carrying is
+    /// entirely a property of the path — and the three paths differ.
+    enum DeliveryPath: String {
+        /// `frame.data.3` — the CVPixelBuffer VideoToolbox itself produced.
+        case videoToolbox
+        /// A software-decoded AVFrame wrapped by `PixelBufferFactory`
+        /// directly — no filter in between.
+        case software
+        /// Delivered from the deinterlacer's output frame and wrapped by
+        /// `PixelBufferFactory`. A VideoToolbox frame reaches this path via
+        /// `softwarePixels(of:)`, which downloads it to the CPU with
+        /// `av_hwframe_transfer_data` — read `hwaccel=` to tell the two apart.
+        /// Deinterlacing is on by default, so this is the ordinary path for
+        /// interlaced broadcast, not an exotic case.
+        case deinterlaced
+    }
+
+    /// Everything that decides how a frame should be colour-tagged, as plain
+    /// integers. Built for every delivered frame; formatted only when it
+    /// differs from the last one logged.
+    struct ColorSignature: Equatable {
+        let path: DeliveryPath
+        /// Whether the *codec context* was opened with the VideoToolbox
+        /// hwaccel, which is not the same question as `path`. On the
+        /// deinterlaced path it is the only way to tell a VideoToolbox frame
+        /// downloaded to the CPU from one that was software-decoded all along,
+        /// and it makes a mid-stream hardware downgrade re-log even when the
+        /// delivery path does not change. `path=software hwaccel=videotoolbox`
+        /// is a real and interesting state: the hwaccel is open, but this
+        /// frame came back in system memory anyway.
+        let hardwareAccelerated: Bool
+        let width: Int32
+        let height: Int32
+        let pixelFormat: Int32
+        let primaries: UInt32
+        let transfer: UInt32
+        let matrix: UInt32
+        let range: UInt32
+
+        init(path: DeliveryPath, hardwareAccelerated: Bool, frame: UnsafeMutablePointer<AVFrame>) {
+            self.path = path
+            self.hardwareAccelerated = hardwareAccelerated
+            width = frame.pointee.width
+            height = frame.pointee.height
+            pixelFormat = frame.pointee.format
+            primaries = frame.pointee.color_primaries.rawValue
+            transfer = frame.pointee.color_trc.rawValue
+            matrix = frame.pointee.colorspace.rawValue
+            range = frame.pointee.color_range.rawValue
+        }
+    }
+
+    /// Dumps the source's own colour signalling next to what CoreVideo is
+    /// actually carrying, so the two can be compared without a debugger.
+    ///
+    /// `CVBufferCopyAttachments(.shouldPropagate)` is exactly the set that
+    /// travels into the `CMSampleBuffer` the renderer enqueues, so an ABSENT
+    /// here is an absent all the way to the display — which is what washed-out
+    /// HDR looks like from the code's side.
+    ///
+    /// What this readout established against `hdr10.mp4` (BT.2020 / PQ /
+    /// BT.2020ncl), and the reason it is worth keeping permanently:
+    ///
+    /// - `path=videoToolbox` — all three keys **PRESENT**. VideoToolbox tags
+    ///   the buffer itself from the bitstream VUI; the zero-copy path needs
+    ///   nothing from us for a correctly signalled stream.
+    /// - `path=software` and `path=deinterlaced` — all three were **ABSENT**,
+    ///   even though the `AVFrame` carried the full signalling.
+    ///   `PixelBufferFactory` built those buffers and attached no colour
+    ///   metadata. That mattered well beyond exotic software decodes: because
+    ///   deinterlacing is on by default and downloads hardware frames to the
+    ///   CPU, an interlaced HDR broadcast lost its colour tags *even on a
+    ///   hardware decode*.
+    ///
+    /// That gap is now closed — `PixelBufferFactory` tags the buffers it
+    /// builds, `AVCOL_*_UNSPECIFIED` mapping to no attachment at all rather
+    /// than to a guessed default — and this readout is the evidence: both CPU
+    /// paths must now report PRESENT for a stream that declares its colour, and
+    /// must still report ABSENT for one that declares nothing. Deleting or
+    /// weakening it removes the only way to tell those two apart in the field.
+    private func logColorHandling(
+        signature: ColorSignature,
+        frame: UnsafeMutablePointer<AVFrame>,
+        pixelBuffer: CVPixelBuffer
+    ) {
+        let attachments = CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) as NSDictionary?
+        func attached(_ key: CFString) -> String {
+            guard let value = attachments?[key] else { return "ABSENT" }
+            return "PRESENT(\(value))"
+        }
+        // The raw value is always printed alongside the name, and not only as
+        // a fallback: FFmpeg's own name for `AVCOL_*_UNSPECIFIED` is the
+        // string "unknown", which is otherwise indistinguishable from a value
+        // it has no name for — and "unspecified" is exactly the case that must
+        // stay distinguishable, because it is the one that maps to no
+        // attachment at all rather than to a guessed default.
+        func named(_ pointer: UnsafePointer<CChar>?, raw: UInt32) -> String {
+            let name = pointer.map { String(cString: $0) } ?? "unnamed"
+            return "\(name)(\(raw))"
+        }
+
+        let source = [
+            "primaries=" + named(
+                av_color_primaries_name(frame.pointee.color_primaries), raw: signature.primaries
+            ),
+            "transfer=" + named(
+                av_color_transfer_name(frame.pointee.color_trc), raw: signature.transfer
+            ),
+            "matrix=" + named(
+                av_color_space_name(frame.pointee.colorspace), raw: signature.matrix
+            ),
+            "range=" + named(
+                av_color_range_name(frame.pointee.color_range), raw: signature.range
+            )
+        ].joined(separator: " ")
+
+        let coreVideo = [
+            "ColorPrimaries=" + attached(kCVImageBufferColorPrimariesKey),
+            "TransferFunction=" + attached(kCVImageBufferTransferFunctionKey),
+            "YCbCrMatrix=" + attached(kCVImageBufferYCbCrMatrixKey)
+        ].joined(separator: " ")
+
+        // Everything CoreVideo carries that is *not* one of the three colour
+        // keys. A count on its own ("4 attachments, none of them colour") is
+        // no use to a measurement pass; the names say whether the buffer is
+        // bare or merely missing colour.
+        let colorKeys: Set<String> = [
+            kCVImageBufferColorPrimariesKey as String,
+            kCVImageBufferTransferFunctionKey as String,
+            kCVImageBufferYCbCrMatrixKey as String
+        ]
+        let otherKeys = (attachments?.allKeys as? [String] ?? [])
+            .filter { !colorKeys.contains($0) }
+            .sorted()
+            .joined(separator: ",")
+
+        let pixelFormatName = av_get_pix_fmt_name(AVPixelFormat(rawValue: signature.pixelFormat))
+            .map { String(cString: $0) } ?? "unknown(\(signature.pixelFormat))"
+
+        let message = "video-format path=\(signature.path.rawValue)"
+            + " hwaccel=\(signature.hardwareAccelerated ? "videotoolbox" : "none")"
+            + " codec=\(parameters.codecName)"
+            + " \(signature.width)x\(signature.height)"
+            + " avframe=\(pixelFormatName)"
+            + " cvpixelbuffer=\(Self.fourCC(CVPixelBufferGetPixelFormatType(pixelBuffer)))"
+            + " source[\(source)]"
+            + " cvbuffer[\(coreVideo)]"
+            + " otherAttachments[\(otherKeys)]"
+        FFmpegRuntime.diagnostics.notice("\(message, privacy: .public)")
+        lock.lock()
+        colorLogCount += 1
+        lock.unlock()
+    }
+
+    /// `'420v'` rather than `875704438`; falls back to the number for the
+    /// pixel-format types that are not four printable characters.
+    static func fourCC(_ value: OSType) -> String {
+        let bytes = [
+            UInt8(truncatingIfNeeded: value >> 24),
+            UInt8(truncatingIfNeeded: value >> 16),
+            UInt8(truncatingIfNeeded: value >> 8),
+            UInt8(truncatingIfNeeded: value)
+        ]
+        guard bytes.allSatisfy({ (0x20...0x7E).contains($0) }),
+              let text = String(bytes: bytes, encoding: .ascii)
+        else { return "\(value)" }
+        return "'\(text)'"
     }
 
     // MARK: Codec lifecycle (decode thread only)

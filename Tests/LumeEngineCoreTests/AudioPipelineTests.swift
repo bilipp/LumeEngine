@@ -9,7 +9,7 @@ import Testing
 @Suite("AudioPipeline", .serialized)
 struct AudioPipelineTests {
     /// Decodes an audio-only sine fixture end to end and returns the frames in order.
-    private func decode(fixture: String, maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
+    private func decode(fixture: String, maxOutputChannels: Int? = 8) async throws -> [AudioFrame] {
         let demuxer = Demuxer(url: try Fixtures.path(fixture))
         var events = demuxer.events.makeAsyncIterator()
         demuxer.start()
@@ -41,7 +41,7 @@ struct AudioPipelineTests {
         return collected
     }
 
-    private func decodeSurround(maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
+    private func decodeSurround(maxOutputChannels: Int? = 8) async throws -> [AudioFrame] {
         try await decode(fixture: "surround71.mkv", maxOutputChannels: maxOutputChannels)
     }
 
@@ -126,6 +126,34 @@ struct AudioPipelineTests {
         // Container timestamp rounding is fine (< 1 ms); anything larger means
         // the renderer sees gaps/overlaps between buffers.
         #expect(worstGap < 1_000, "worst PTS gap \(worstGap) µs between consecutive audio frames")
+    }
+
+    /// The width the host negotiates has to survive the whole session, and the
+    /// engine resolves it in exactly one place. `nil` must still mean "ask the
+    /// audio session", which is what every pre-existing caller relies on.
+    @Test("configured output width wins; nil keeps the session-read default", .timeLimit(.minutes(1)))
+    func configuredOutputWidthResolution() async throws {
+        // A default configuration states nothing, so nothing changes for
+        // existing hosts.
+        #expect(PlayerConfiguration().maxOutputChannels == nil)
+
+        // nil resolves to the platform default (2 on macOS, where these tests
+        // run and there is no AVAudioSession) — identical to the pre-config
+        // behaviour, and it downmixes rather than passing 8ch through.
+        let defaulted = try await decodeSurround(maxOutputChannels: nil)
+        let defaultWidth = try #require(defaulted.first?.channels)
+        #expect(defaultWidth == AudioDecoder.defaultMaxOutputChannels())
+
+        // An explicit width wins over that resolution on every platform —
+        // including macOS, where the fallback is a flat 2.
+        let widened = try await decodeSurround(maxOutputChannels: 6)
+        #expect(widened.first?.channels == 6)
+        #expect(!widened.isEmpty)
+
+        // And it is a ceiling, never a floor: a 5.1 source stays 5.1 when the
+        // route is wider. Over-shooting the renderer is worse than downmixing.
+        let truehd = try await decode(fixture: "truehd.mkv", maxOutputChannels: 8)
+        #expect(truehd.first?.channels == 6)
     }
 
     @Test("audio timeline: buffers are sample-contiguous despite container PTS jitter", .timeLimit(.minutes(1)))
