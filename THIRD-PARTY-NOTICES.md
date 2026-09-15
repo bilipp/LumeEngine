@@ -9,14 +9,14 @@ what you have to do about it.
 
 ## FFmpeg — LGPL 2.1 or later
 
-LumeEngine links **FFmpeg 8.1.2** (`libavcodec`, `libavformat`, `libavutil`,
+LumeEngine links **FFmpeg 9.0.1** (`libavcodec`, `libavformat`, `libavutil`,
 `libavfilter`, `libswscale`, `libswresample`). The pinned version and source URL live in
 [`build/versions.json`](build/versions.json); the build is performed by
 [`build/scripts/build-ffmpeg.sh`](build/scripts/build-ffmpeg.sh).
 
 - **License**: GNU Lesser General Public License, version 2.1 or later — full text in
   [`LICENSES/LGPL-2.1.txt`](LICENSES/LGPL-2.1.txt) (verbatim copy of `COPYING.LGPLv2.1`
-  from the FFmpeg 8.1.2 tarball).
+  from the FFmpeg 9.0.1 tarball).
 - **Upstream**: <https://ffmpeg.org> · <https://git.ffmpeg.org/ffmpeg.git>
 
 ### The build is LGPL, not GPL

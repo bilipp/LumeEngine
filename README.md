@@ -1,11 +1,11 @@
 # LumeEngine
 
-An FFmpeg 8-based media player engine for Apple platforms, designed from scratch for stability on long-running IPTV streams. Built for [Lume](https://github.com/bilipp/Lume).
+An FFmpeg 9-based media player engine for Apple platforms, designed from scratch for stability on long-running IPTV streams. Built for [Lume](https://github.com/bilipp/Lume).
 
 [![CI](https://github.com/bilipp/LumeEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/bilipp/LumeEngine/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%2018%20·%20tvOS%2018%20·%20macOS%2015%20·%20visionOS%202-1f1f2e?labelColor=1f1f2e)](#installation)
 [![Swift](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white&labelColor=1f1f2e)](https://swift.org)
-[![FFmpeg](https://img.shields.io/badge/FFmpeg-8.1.2%20LGPL-007808?labelColor=1f1f2e)](THIRD-PARTY-NOTICES.md)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-9.0.1%20LGPL-007808?labelColor=1f1f2e)](THIRD-PARTY-NOTICES.md)
 [![License](https://img.shields.io/badge/license-MIT-blue?labelColor=1f1f2e)](LICENSE)
 
 > **Status: pre-1.0, beta.** The engine plays real IPTV content and ships as an opt-in beta engine in Lume, but the public API is not yet frozen — expect breaking changes between 0.x releases.
@@ -14,7 +14,7 @@ An original architecture, not a fork of an existing player. See [PLAN.md](PLAN.m
 
 ## Highlights
 
-- **FFmpeg 8.1.x**, LGPL configuration, built by an in-repo pipeline (`build/`) into a single `FFmpeg.xcframework` with App Store-clean slices for all platforms — no bundle-ID patching scripts.
+- **FFmpeg 9.0.x**, LGPL configuration, built by an in-repo pipeline (`build/`) into a single `FFmpeg.xcframework` with App Store-clean slices for all platforms — no bundle-ID patching scripts.
 - **System-quality A/V sync**: decoded frames feed `AVSampleBufferRenderSynchronizer` — Apple's clock owns sync, rate, HDR tone mapping, and PiP. No hand-rolled drop-frame heuristics.
 - **One hardware decode path** (FFmpeg-managed VideoToolbox) with a single, tested software-fallback policy.
 - **Honest Swift 6 concurrency**: actors for control, dedicated threads + bounded PTS-accounted channels for data, RAII wrappers around FFmpeg objects, session epochs instead of rebuild-in-place.
@@ -89,7 +89,7 @@ To build FFmpeg yourself instead — required if you change `build/versions.json
 
 ```bash
 # FFmpeg xcframework (10-20 min for one slice)
-curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+curl -sLo build/ffmpeg-9.0.1.tar.xz https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
 build/scripts/build-ffmpeg.sh macos-arm64        # one slice is enough for local dev
 build/scripts/make-xcframework.sh                # -> BinaryDependencies/FFmpeg.xcframework
 
