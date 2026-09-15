@@ -67,10 +67,16 @@ gen truehd.mkv \
 # first. `interlace` halves the 50p source into 25i; +ilme+ildct makes the
 # encoder code the fields rather than quietly encoding a combed progressive
 # frame, so the decoder actually sets AV_FRAME_FLAG_INTERLACED.
+#
+# Field order comes from the `interlace` filter, which flags every frame TFF.
+# Do not re-assert it with the encoder's `-top 1`: that was AVCodecContext's
+# deprecated top_field_first, and an FFmpeg 9 host CLI rejects it outright
+# ("Codec AVOption top (top field first) is not a encoding option"), which
+# fails fixture generation and with it every deinterlace test.
 gen interlaced.ts \
     -f lavfi -i "testsrc2=duration=4:size=640x360:rate=50" \
     -vf "interlace=scan=tff" \
-    -c:v mpeg2video -flags +ilme+ildct -top 1 -g 25 -f mpegts
+    -c:v mpeg2video -flags +ilme+ildct -g 25 -f mpegts
 
 # Two audio languages where the container's own default flag (eng) is the
 # *wrong* answer for a German-preferring viewer: the ordered preference must
