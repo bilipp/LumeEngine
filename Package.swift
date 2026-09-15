@@ -81,13 +81,13 @@ let package = Package(
         .visionOS(.v2),
     ],
     products: [
-        // Dynamic: FFmpeg 8 symbols stay inside LumeEngine.framework (two-level
+        // Dynamic: FFmpeg 9 symbols stay inside LumeEngine.framework (two-level
         // namespace), so apps can also link engines embedding other FFmpeg builds
         // without symbol collisions.
         .library(name: "LumeEngine", type: .dynamic, targets: ["LumeEngine"]),
     ],
     targets: [
-        // FFmpeg 8.1.x static libraries: released artifact, or a local build when
+        // FFmpeg 9.0.x static libraries: released artifact, or a local build when
         // one is present (resolved above).
         ffmpegTarget,
 
