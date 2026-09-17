@@ -5,8 +5,14 @@ import Foundation
 // ordinary seek path to re-sync all lanes from the playhead — no bespoke
 // "partial rebuild" states to get wrong.
 extension PlayerSession {
-    /// Switches the audio lane to another stream of the open source.
-    public func selectAudioTrack(_ index: Int32) {
+    /// Switches the audio lane to another stream of the open source, or tears it
+    /// down with `nil` — matching `selectSubtitleTrack`, where `nil` means off.
+    public func selectAudioTrack(_ index: Int32?) {
+        guard let index else {
+            guard selectedAudioTrackIndex != nil else { return }
+            teardownAudioLane()
+            return
+        }
         guard let demuxer = activeDemuxer,
               index != selectedAudioTrackIndex,
               let parameters = demuxer.codecParameters(forStream: index)
@@ -19,6 +25,30 @@ extension PlayerSession {
         if mediaInfo?.isSeekable == true {
             seek(to: position)
         }
+    }
+
+    /// Turns audio on or off for an already-open session, landing on the track
+    /// `open` would have chosen.
+    ///
+    /// This is not a mute: muting silences the renderer while it keeps pulling
+    /// frames and keeps its claim on the audio output route. Where several
+    /// sessions play at once — Lume's Multi-View grid runs up to four — a silent
+    /// one must hold no claim at all, because a renderer that cannot get the
+    /// route never becomes ready and stalls the synchronizer its video lane
+    /// shares. Use `renderer.isMuted` for a momentary silence, this to give the
+    /// audio up.
+    ///
+    /// A source with no audio track, or a session not yet open, is a no-op.
+    public func setAudioEnabled(_ enabled: Bool) {
+        guard enabled else {
+            selectAudioTrack(nil)
+            return
+        }
+        guard selectedAudioTrackIndex == nil,
+              let info = mediaInfo,
+              let track = defaultAudioTrack(in: info)
+        else { return }
+        selectAudioTrack(track.index)
     }
 
     /// Selects an embedded subtitle track, or `nil` to disable subtitles.

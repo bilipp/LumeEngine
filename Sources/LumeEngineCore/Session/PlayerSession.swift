@@ -214,10 +214,7 @@ public actor PlayerSession {
         let videoTrack = configuration.enableVideo
             ? info.videoTracks.first(where: \.isDefault) ?? info.videoTracks.first
             : nil
-        let audioTrack = configuration.enableAudio
-            ? TrackLanguageMatcher.bestMatch(in: info.audioTracks, preferring: configuration.preferredAudioLanguages)
-            ?? info.audioTracks.first(where: \.isDefault) ?? info.audioTracks.first
-            : nil
+        let audioTrack = configuration.enableAudio ? defaultAudioTrack(in: info) : nil
 
         guard videoTrack != nil || audioTrack != nil else {
             throw EngineError(code: .unsupported, message: "source has no playable tracks")
@@ -515,6 +512,33 @@ public actor PlayerSession {
             durationBudget: MediaTime.microseconds(configuration.packetReadAhead),
             measure: { max($0.duration, 0) }
         )
+    }
+
+    /// The audio track `open` chooses: the viewer's preferred language when the
+    /// source carries it, else the source's own default. Shared with
+    /// `setAudioEnabled` so a lane switched on later lands on the same track the
+    /// session would have opened with.
+    func defaultAudioTrack(in info: MediaInfo) -> TrackInfo? {
+        TrackLanguageMatcher.bestMatch(in: info.audioTracks, preferring: configuration.preferredAudioLanguages)
+            ?? info.audioTracks.first(where: \.isDefault) ?? info.audioTracks.first
+    }
+
+    /// Tears the audio lane down completely, leaving the session playing video
+    /// only. The renderer drops its output-route claim (see `SystemRenderer`),
+    /// which is the point: a silent source must not hold a route another session
+    /// needs. Mirrors `teardownSubtitleLane`.
+    func teardownAudioLane() {
+        if let old = selectedAudioTrackIndex {
+            demuxer?.detach(streamIndex: old)
+        }
+        audioDecoder?.shutdown(deadline: 2)
+        audioPackets?.close()
+        audioDecoder = nil
+        audioPackets = nil
+        audioFrames = nil
+        selectedAudioTrackIndex = nil
+        audioAtEOF = false
+        renderer.attach(video: videoFrames, audio: nil)
     }
 
     func replaceAudioLane(demuxer: Demuxer, trackIndex: Int32, parameters: CodecParameters) {

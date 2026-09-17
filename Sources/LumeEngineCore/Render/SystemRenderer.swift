@@ -48,7 +48,14 @@ public final class SystemRenderer: @unchecked Sendable {
     /// with no event (§3.3: silence is never a failure mode) — the session
     /// must surface this as a typed failure. Set before `attach`.
     public var onRenderFailure: (@Sendable (EngineError) -> Void)?
-    private var statusObservations: [NSKeyValueObservation] = []
+    // One handle per lane rather than an append-only list: `attach` is called
+    // again on every track switch, which would otherwise stack a fresh observer
+    // on the same renderer each time.
+    private var videoObservation: NSKeyValueObservation?
+    private var audioObservation: NSKeyValueObservation?
+    /// Whether a lane is currently feeding its renderer. Guarded by `lock`.
+    private var videoLaneAttached = false
+    private var audioLaneAttached = false
     private var reportedFailure = false
 
     public init(muted: Bool = false) {
@@ -58,41 +65,79 @@ public final class SystemRenderer: @unchecked Sendable {
         audioRenderer.isMuted = muted
 
         synchronizer.addRenderer(videoRenderer)
-        synchronizer.addRenderer(audioRenderer)
+        // The audio renderer is added by `attach` when a lane actually feeds it
+        // and removed again by `detachAudioRenderer`. A renderer that is fed
+        // claims the output route, and on tvOS the route is scarce enough that a
+        // second claimant never becomes ready — which stalls the synchronizer the
+        // video lane shares, freezing the picture on its first frame with no
+        // failure event. Multi-View plays up to four sources at once, so an
+        // audio-less tile must hold no claim at all.
         synchronizer.setRate(0, time: .zero)
     }
 
     // MARK: Wiring
 
     /// Attaches decoded-frame channels and starts pulling. `nil` disables a lane.
+    ///
+    /// Safe to call repeatedly — a track switch re-attaches the same lane — and
+    /// each lane only starts or stops on an actual transition, so re-attaching
+    /// audio does not re-observe or re-request on a renderer already running.
     public func attach(video: Channel<VideoFrame>?, audio: Channel<AudioFrame>?) {
         lock.lock()
         videoInput = video
         audioInput = audio
+        let videoWasAttached = videoLaneAttached
+        let audioWasAttached = audioLaneAttached
+        videoLaneAttached = video != nil
+        audioLaneAttached = audio != nil
         lock.unlock()
 
-        var observations: [NSKeyValueObservation] = []
-        if video != nil {
-            observations.append(videoRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
+        if video != nil, !videoWasAttached {
+            let observation = videoRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
                 guard renderer.status == .failed else { return }
                 self?.reportRenderFailure(lane: "video", underlying: renderer.error)
-            })
+            }
+            lock.lock()
+            videoObservation = observation
+            lock.unlock()
             videoRenderer.requestMediaDataWhenReady(on: videoQueue) { [weak self] in
                 self?.pumpVideo()
             }
         }
+
         if audio != nil {
-            observations.append(audioRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
+            guard !audioWasAttached else { return }
+            synchronizer.addRenderer(audioRenderer)
+            let observation = audioRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
                 guard renderer.status == .failed else { return }
                 self?.reportRenderFailure(lane: "audio", underlying: renderer.error)
-            })
+            }
+            lock.lock()
+            audioObservation = observation
+            lock.unlock()
             audioRenderer.requestMediaDataWhenReady(on: audioQueue) { [weak self] in
                 self?.pumpAudio()
             }
+        } else if audioWasAttached {
+            detachAudioRenderer()
         }
+    }
+
+    /// Releases the audio output route: stop pulling, drop what is queued, and
+    /// leave the synchronizer so nothing is holding a claim. Mirrors the audio
+    /// half of `shutdown`, which is the proven release sequence.
+    private func detachAudioRenderer() {
         lock.lock()
-        statusObservations.append(contentsOf: observations)
+        let observation = audioObservation
+        audioObservation = nil
         lock.unlock()
+        observation?.invalidate()
+        audioRenderer.stopRequestingMediaData()
+        audioRenderer.flush()
+        // A lane given up before the clock ever ran has no valid current time —
+        // dropping a tile's audio during startup is exactly that case.
+        let now = synchronizer.currentTime()
+        synchronizer.removeRenderer(audioRenderer, at: now.isValid ? now : .zero)
     }
 
     private func reportRenderFailure(lane: String, underlying: Error?) {
@@ -198,8 +243,11 @@ public final class SystemRenderer: @unchecked Sendable {
     public func shutdown() {
         lock.lock()
         stopped = true
-        let observations = statusObservations
-        statusObservations = []
+        let observations = [videoObservation, audioObservation].compactMap { $0 }
+        videoObservation = nil
+        audioObservation = nil
+        videoLaneAttached = false
+        audioLaneAttached = false
         lock.unlock()
         observations.forEach { $0.invalidate() }
         videoRenderer.stopRequestingMediaData()
