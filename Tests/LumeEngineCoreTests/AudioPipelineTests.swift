@@ -30,15 +30,28 @@ struct AudioPipelineTests {
             parameters: parameters, input: packets, output: frames,
             maxOutputChannels: maxOutputChannels
         )
+        var decodeEvents = decoder.events.makeAsyncIterator()
         decoder.start()
         demuxer.resume()
         defer { decoder.shutdown() }
 
-        var collected: [AudioFrame] = []
-        while let frame = frames.receive(timeout: 5) {
-            collected.append(frame)
+        // Drained on a dedicated thread, and ended by the channel close that
+        // `shutdown()` does — not by a wall-clock timeout, which both burns
+        // seconds per test and truncates the tail under load (`ChannelDrain`).
+        let collector = ChannelDrain(frames, into: [AudioFrame]()) { $0.append($1) }
+
+        while let event = await events.next() {
+            if case .endOfStream = event {
+                decoder.signalEndOfStream()
+                break
+            }
         }
-        return collected
+        guard case .endOfStream? = await decodeEvents.next() else {
+            throw EngineError(code: .decodeFailed, message: "\(fixture): decoder never reached EOF")
+        }
+        decoder.shutdown()
+
+        return await collector.value
     }
 
     private func decodeSurround(maxOutputChannels: Int = 8) async throws -> [AudioFrame] {
