@@ -182,8 +182,11 @@ final class DolbyVisionReshaper {
             poolWidth = width
             poolHeight = height
         }
+        guard let pool else {
+            throw EngineError(code: .decodeFailed, message: "Dolby Vision reshape: no buffer pool")
+        }
         var buffer: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &buffer)
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
         guard status == kCVReturnSuccess, let buffer else {
             throw EngineError(code: .decodeFailed, message: "Dolby Vision reshape: buffer allocation failed (\(status))")
         }
