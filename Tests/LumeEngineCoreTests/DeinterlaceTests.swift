@@ -9,14 +9,14 @@ import Testing
 @Suite("Deinterlace", .serialized)
 struct DeinterlaceTests {
     private struct Decoded: Sendable {
-        var pts: [Int64]
-        var durations: [Int64]
-        var pixelFormats: Set<OSType>
-        var zeroCopy: Set<Bool>
+        var pts: [Int64] = []
+        var durations: [Int64] = []
+        var pixelFormats: Set<OSType> = []
+        var zeroCopy: Set<Bool> = []
         /// Whether the decoder ever reported a filter engaged.
-        var wasFiltering: Bool
+        var wasFiltering = false
         /// Whether the codec itself ran on VideoToolbox.
-        var hardwareDecode: Bool
+        var hardwareDecode = false
 
         var frameCount: Int { pts.count }
         /// Gaps between consecutive presentation times, engine µs.
@@ -53,27 +53,19 @@ struct DeinterlaceTests {
         decoder.start()
         demuxer.resume()
 
-        // Drain on a background thread: the frame channel is bounded, so a
-        // consumer that waits for EOF first would deadlock the decoder.
-        // `isDeinterlacing` is sampled here rather than after EOF: the drain
-        // releases the graph, so by the time the decoder reports end of stream
-        // the flag is legitimately back to false.
-        let collector = Task.detached {
-            var pts: [Int64] = []
-            var durations: [Int64] = []
-            var pixelFormats: Set<OSType> = []
-            var zeroCopy: Set<Bool> = []
-            var filtering = false
-            var hardware = false
-            while let frame = frames.receive(timeout: 5) {
-                pts.append(frame.pts)
-                durations.append(frame.duration)
-                pixelFormats.insert(CVPixelBufferGetPixelFormatType(frame.pixelBuffer))
-                zeroCopy.insert(frame.isHardwareDecoded)
-                filtering = filtering || decoder.isDeinterlacing
-                hardware = hardware || decoder.isHardwareActive
-            }
-            return (pts, durations, pixelFormats, zeroCopy, filtering, hardware)
+        // Drain on a dedicated thread: the frame channel is bounded, so a
+        // consumer that waits for EOF first would deadlock the decoder — and a
+        // consumer on the concurrency pool would starve this body's `await`s
+        // (see `ChannelDrain`). `isDeinterlacing` is sampled per frame rather
+        // than after EOF: the drain releases the graph, so by the time the
+        // decoder reports end of stream the flag is legitimately back to false.
+        let collector = ChannelDrain(frames, into: Decoded()) { collected, frame in
+            collected.pts.append(frame.pts)
+            collected.durations.append(frame.duration)
+            collected.pixelFormats.insert(CVPixelBufferGetPixelFormatType(frame.pixelBuffer))
+            collected.zeroCopy.insert(frame.isHardwareDecoded)
+            collected.wasFiltering = collected.wasFiltering || decoder.isDeinterlacing
+            collected.hardwareDecode = collected.hardwareDecode || decoder.isHardwareActive
         }
 
         while let event = await demuxEvents.next() {
@@ -86,17 +78,9 @@ struct DeinterlaceTests {
             decoder.shutdown()
             throw EngineError(code: .decodeFailed, message: "decoder never reached EOF")
         }
-        decoder.shutdown()
+        decoder.shutdown() // closes the frame channel; the drain ends on that
 
-        let (pts, durations, pixelFormats, zeroCopy, filtering, hardware) = await collector.value
-        return Decoded(
-            pts: pts,
-            durations: durations,
-            pixelFormats: pixelFormats,
-            zeroCopy: zeroCopy,
-            wasFiltering: filtering,
-            hardwareDecode: hardware
-        )
+        return await collector.value
     }
 
     @Test("off: interlaced content passes through untouched", .timeLimit(.minutes(1)))

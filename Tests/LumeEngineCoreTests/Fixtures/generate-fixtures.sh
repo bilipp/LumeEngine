@@ -67,13 +67,16 @@ gen truehd.mkv \
 # arrives in: 50 fields/s woven into 25 flagged interlaced frames, top field
 # first. `interlace` halves the 50p source into 25i; +ilme+ildct makes the
 # encoder code the fields rather than quietly encoding a combed progressive
-# frame, so the decoder actually sets AV_FRAME_FLAG_INTERLACED. `setparams`
-# carries the TFF field order (the `-top` encoder option that used to do this
-# was removed in FFmpeg 8 — with it, generation aborts under `set -e` and every
-# fixture declared after this one silently never gets built).
+# frame, so the decoder actually sets AV_FRAME_FLAG_INTERLACED.
+#
+# Field order comes from the `interlace` filter, which flags every frame TFF.
+# Do not re-assert it with the encoder's `-top 1`: that was AVCodecContext's
+# deprecated top_field_first, and an FFmpeg 9 host CLI rejects it outright
+# ("Codec AVOption top (top field first) is not a encoding option"), which
+# fails fixture generation and with it every deinterlace test.
 gen interlaced.ts \
     -f lavfi -i "testsrc2=duration=4:size=640x360:rate=50" \
-    -vf "interlace=scan=tff,setparams=field_mode=tff" \
+    -vf "interlace=scan=tff" \
     -c:v mpeg2video -flags +ilme+ildct -g 25 -f mpegts
 
 # HDR10 signalling, which is the whole subject of issue #207: BT.2020 primaries,

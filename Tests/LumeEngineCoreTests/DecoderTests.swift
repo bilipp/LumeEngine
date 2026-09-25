@@ -6,6 +6,26 @@ import Testing
 
 @Suite("Decoders", .serialized)
 struct DecoderTests {
+    /// What a video drain keeps per frame — the frame itself holds a pixel
+    /// buffer the test has no reason to retain for the length of a stream.
+    private struct DecodedVideoFrame: Sendable {
+        let pts: Int64
+        let width: Int
+        let height: Int
+        let format: OSType
+        let hardware: Bool
+    }
+
+    /// What an audio drain keeps: everything the assertions need, folded as
+    /// frames arrive.
+    private struct DecodedAudio: Sendable {
+        var totalSamples = 0
+        var ptsValues: [Int64] = []
+        var channels: Set<Int> = []
+        var rates: Set<Int> = []
+        var peak: Float = 0
+    }
+
     /// Opens a fixture and returns (demuxer, info) ready for track attachment.
     private func open(_ fixture: String) async throws -> (Demuxer, MediaInfo, AsyncStream<DemuxEvent>.Iterator) {
         let demuxer = Demuxer(url: try Fixtures.path(fixture))
@@ -35,17 +55,17 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        // Consume frames on a background task while awaiting decoder EOF.
-        let collector = Task.detached {
-            var collected: [(pts: Int64, width: Int, height: Int, format: OSType, hardware: Bool)] = []
-            while let frame = frames.receive(timeout: 5) {
-                collected.append((
-                    frame.pts, frame.width, frame.height,
-                    CVPixelBufferGetPixelFormatType(frame.pixelBuffer),
-                    frame.isHardwareDecoded
-                ))
-            }
-            return collected
+        // Consume frames on a dedicated thread while awaiting decoder EOF —
+        // never on the concurrency pool, which this body's `await`s need (see
+        // `ChannelDrain`).
+        let collector = ChannelDrain(frames, into: [DecodedVideoFrame]()) { collected, frame in
+            collected.append(DecodedVideoFrame(
+                pts: frame.pts,
+                width: frame.width,
+                height: frame.height,
+                format: CVPixelBufferGetPixelFormatType(frame.pixelBuffer),
+                hardware: frame.isHardwareDecoded
+            ))
         }
 
         // Demux hits EOF → tell the decoder to drain.
@@ -129,20 +149,12 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        let collector = Task.detached {
-            var totalSamples = 0
-            var ptsValues: [Int64] = []
-            var channels = Set<Int>()
-            var rates = Set<Int>()
-            var peak: Float = 0
-            while let frame = frames.receive(timeout: 5) {
-                totalSamples += frame.sampleCount
-                ptsValues.append(frame.pts)
-                channels.insert(frame.channels)
-                rates.insert(frame.sampleRate)
-                for sample in frame.samples { peak = max(peak, abs(sample)) }
-            }
-            return (totalSamples, ptsValues, channels, rates, peak)
+        let collector = ChannelDrain(frames, into: DecodedAudio()) { collected, frame in
+            collected.totalSamples += frame.sampleCount
+            collected.ptsValues.append(frame.pts)
+            collected.channels.insert(frame.channels)
+            collected.rates.insert(frame.sampleRate)
+            for sample in frame.samples { collected.peak = max(collected.peak, abs(sample)) }
         }
 
         while let event = await demuxEvents.next() {
@@ -158,14 +170,15 @@ struct DecoderTests {
         }
         decoder.shutdown()
 
-        let (totalSamples, ptsValues, channels, rates, peak) = await collector.value
-        let rate = try #require(rates.first)
-        #expect(rates.count == 1)
-        #expect(channels == [1], "sine fixture is mono")
-        let seconds = Double(totalSamples) / Double(rate)
+        let collected = await collector.value
+        let rate = try #require(collected.rates.first)
+        #expect(collected.rates.count == 1)
+        #expect(collected.channels == [1], "sine fixture is mono")
+        let seconds = Double(collected.totalSamples) / Double(rate)
         #expect(abs(seconds - 10.0) < 0.3, "expected ~10 s of audio, got \(seconds)")
+        let ptsValues = collected.ptsValues
         #expect(zip(ptsValues, ptsValues.dropFirst()).allSatisfy { $0 < $1 }, "audio PTS must be monotonic")
-        #expect(peak > 0.1, "a sine wave must have non-silent samples (peak \(peak))")
+        #expect(collected.peak > 0.1, "a sine wave must have non-silent samples (peak \(collected.peak))")
     }
 
     @Test("audio: 7.1 channel layout survives into the CMSampleBuffer", .timeLimit(.minutes(1)))

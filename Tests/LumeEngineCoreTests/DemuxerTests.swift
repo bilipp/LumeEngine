@@ -4,10 +4,10 @@ import Testing
 
 @Suite("FFmpegRuntime")
 struct FFmpegRuntimeTests {
-    @Test("linked FFmpeg is the 8.x line")
+    @Test("linked FFmpeg is the 9.x line")
     func version() {
-        // libavutil major 60 == FFmpeg 8.x (59 = 7.x, 58 = 6.x).
-        #expect(FFmpegRuntime.avutilMajorVersion == 60, "expected FFmpeg 8.x, got \(FFmpegRuntime.versions)")
+        // libavutil major 61 == FFmpeg 9.x (60 = 8.x, 59 = 7.x).
+        #expect(FFmpegRuntime.avutilMajorVersion == 61, "expected FFmpeg 9.x, got \(FFmpegRuntime.versions)")
     }
 }
 

@@ -268,6 +268,84 @@ struct PlayerSessionTests {
         await session.shutdown()
     }
 
+    // MARK: Audio lane on/off
+
+    // Several sessions playing at once (Lume's Multi-View grid) cannot all hold
+    // the audio output route: a muted renderer still claims it, and on tvOS a
+    // second claimant never becomes ready, stalling the synchronizer its video
+    // lane shares. A silent source therefore carries no audio lane at all, which
+    // makes turning one on and off again after open a supported transition.
+
+    private func makeAudioToggleSession(enableAudio: Bool, audioLanguages: [String] = []) -> PlayerSession {
+        var configuration = PlayerConfiguration()
+        configuration.muted = true
+        configuration.bufferTarget = 0.5
+        configuration.enableAudio = enableAudio
+        configuration.preferredAudioLanguages = audioLanguages
+        return PlayerSession(configuration: configuration)
+    }
+
+    @Test("a session opened without audio can turn it on later", .timeLimit(.minutes(1)))
+    func audioCanBeEnabledAfterOpen() async throws {
+        let session = makeAudioToggleSession(enableAudio: false)
+        let info = try await session.open(url: try Fixtures.path("multilang.mkv"))
+        #expect(await session.selectedAudioTrackIndex == nil, "opening with enableAudio false must build no lane")
+
+        await session.setAudioEnabled(true)
+        let english = try #require(info.audioTracks.first { $0.language == "eng" })
+        #expect(
+            await session.selectedAudioTrackIndex == english.index,
+            "enabling audio must land on the track open would have chosen"
+        )
+
+        await session.shutdown()
+    }
+
+    @Test("enabling audio honours the preferred language", .timeLimit(.minutes(1)))
+    func enablingAudioHonoursPreference() async throws {
+        // The same preference open() would have applied, applied late instead.
+        let session = makeAudioToggleSession(enableAudio: false, audioLanguages: ["de", "en"])
+        let info = try await session.open(url: try Fixtures.path("multilang.mkv"))
+        #expect(await session.selectedAudioTrackIndex == nil)
+
+        await session.setAudioEnabled(true)
+        let german = try #require(info.audioTracks.first { $0.language == "ger" })
+        #expect(await session.selectedAudioTrackIndex == german.index)
+
+        await session.shutdown()
+    }
+
+    @Test("disabling audio tears the lane down", .timeLimit(.minutes(1)))
+    func audioCanBeDisabledAfterOpen() async throws {
+        let session = makeAudioToggleSession(enableAudio: true)
+        _ = try await session.open(url: try Fixtures.path("multilang.mkv"))
+        #expect(await session.selectedAudioTrackIndex != nil, "precondition: the session opened with a lane")
+
+        await session.setAudioEnabled(false)
+        #expect(await session.selectedAudioTrackIndex == nil, "disabling audio must leave no lane")
+
+        await session.shutdown()
+    }
+
+    @Test("audio survives being switched off and back on", .timeLimit(.minutes(1)))
+    func audioSurvivesToggling() async throws {
+        // Multi-View moves the audio between tiles, so a tile can give the lane
+        // up and take it back repeatedly within one session.
+        let session = makeAudioToggleSession(enableAudio: true)
+        _ = try await session.open(url: try Fixtures.path("multilang.mkv"))
+        let opened = try #require(await session.selectedAudioTrackIndex)
+
+        for _ in 0 ..< 3 {
+            await session.setAudioEnabled(false)
+            #expect(await session.selectedAudioTrackIndex == nil)
+            await session.setAudioEnabled(true)
+            #expect(await session.selectedAudioTrackIndex == opened)
+        }
+
+        #expect(await session.state != .failed, "toggling the lane must not fail the session")
+        await session.shutdown()
+    }
+
     @Test("foreign audio auto-enables a forced subtitle track", .timeLimit(.minutes(1)))
     func forcedSubtitlesUnderForeignAudio() async throws {
         // forcedsubs.mkv has English audio only; a German-preferring viewer

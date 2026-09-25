@@ -4,7 +4,7 @@ This file provides guidance to coding agents (Claude Code and others) when worki
 
 ## What this is
 
-LumeEngine is an FFmpeg 8-based media player engine for Apple platforms (iOS 18+, tvOS 18+, macOS 15+, visionOS 2+), built as a Swift 6 package for the Lume IPTV app. It is an original architecture designed around a stability doctrine: **PLAN.md is the authoritative design document** — §3 catalogs legacy-engine failure modes and the structural countermeasures that are hard requirements, §4 covers architecture decisions (D1–D9), §9 the roadmap. When making design decisions, check PLAN.md first.
+LumeEngine is an FFmpeg 9-based media player engine for Apple platforms (iOS 18+, tvOS 18+, macOS 15+, visionOS 2+), built as a Swift 6 package for the Lume IPTV app. It is an original architecture designed around a stability doctrine: **PLAN.md is the authoritative design document** — §3 catalogs legacy-engine failure modes and the structural countermeasures that are hard requirements, §4 covers architecture decisions (D1–D9), §9 the roadmap. When making design decisions, check PLAN.md first.
 
 ## Relationship to Lume (`../Lume`)
 
@@ -42,7 +42,7 @@ swift run LumeEngineDemo                      # macOS demo app with diagnostics 
 Prerequisites:
 - `BinaryDependencies/FFmpeg.xcframework` must exist before anything compiles. Build it once (or after bumping `build/versions.json`):
   ```bash
-  curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+  curl -sLo build/ffmpeg-9.0.1.tar.xz https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
   build/scripts/build-ffmpeg.sh macos-arm64    # one slice is enough for local dev
   build/scripts/make-xcframework.sh
   ```
@@ -54,7 +54,7 @@ CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/
 
 Three-layer target structure (`Package.swift`):
 
-- **`CFFmpeg`** — binary target wrapping `BinaryDependencies/FFmpeg.xcframework` (FFmpeg 8.1.x static libs, LGPL config, built by `build/scripts/`).
+- **`CFFmpeg`** — binary target wrapping `BinaryDependencies/FFmpeg.xcframework` (FFmpeg 9.0.x static libs, LGPL config, built by `build/scripts/`).
 - **`Sources/LumeEngineCore`** — the engine, no UI. Uses `internal import CFFmpeg` + library evolution so FFmpeg types never leak into consumers' compiles (apps can link other FFmpeg-based engines without symbol/module collisions — this is why the product is a **dynamic** library; don't change that). This is not theoretical: removing `-enable-library-evolution` broke Lume immediately, because it links FFmpegKit too and Clang then sees `enum AVPixelFormat` defined differently in `CFFmpeg` and `Libavutil`. Nesting the headers under `lume_ffmpeg/` stops header-path collisions but not C-namespace redefinition — evolution is what keeps `CFFmpeg` out of the consumer's compile.
 - **The evolution flag is conditional in `Package.swift`** (`isVersionedDependency`, detected by `/checkouts/` in `#filePath`), because SwiftPM forbids `unsafeFlags` in version-resolved dependencies and there is no safe library-evolution setting. Path dependencies — Lume, its worktrees via the `LumeEngine` symlink, and engine development — get the flag; `.package(url:from:)` consumers don't, and such a consumer must not link a second FFmpeg (tell them to vendor by path instead). Don't collapse either conditional in that manifest.
 - **`Sources/LumeEngine`** — public facade: `LumePlayer` (`@MainActor @Observable`), `LumePlayerView` (SwiftUI).

@@ -9,7 +9,7 @@ A ground-up FFmpeg-based player engine for Apple platforms (iOS, iPadOS, tvOS, m
 **Goals**
 
 1. **Stability over everything.** Every failure mode Lume works around in the third-party engines it shipped with must be impossible by design (see §3).
-2. **Latest FFmpeg.** Pinned to FFmpeg **8.1.2** (current stable, 2026-06), with our own upgrade path — never stuck on an old fork.
+2. **Latest FFmpeg.** Pinned to FFmpeg **9.0.1** (current stable, 2026-08), with our own upgrade path — never stuck on an old fork.
 3. **Full modern feature set**: HW decode, HDR10/HLG/DV, libass subtitles, PiP, Now Playing, trickplay, live rewind, zero-delay switching, upscaling, 360°/VR, Blu-ray ISO.
 4. **Reusable**: engine code MIT/Apache-2.0, FFmpeg built in LGPL configuration, libass (ISC) — usable beyond AGPL Lume.
 5. **First-class Lume integration**: drop-in `PlayerEngineKind` case conforming to Lume's existing engine contract and `TVPlaybackEngine`.
@@ -44,7 +44,7 @@ Committed (per scope decision): everything in the stability core, plus:
 
 | Pack | Features |
 |---|---|
-| **Core** | FFmpeg 8.1 demux/decode all formats, VideoToolbox HW decode + SW fallback, HDR10/HLG/DV Profile 5 & 8, AV1 (dav1d + HW), 8K/120fps capable pipeline, audio/subtitle track selection, libass full ASS rendering, PGS/DVB/VobSub bitmap subs, external subtitle files (SRT/VTT/ASS/SUP), main+secondary subtitles, word-by-word cues, accurate & fast seek, memory cache fast-seek, playback rate w/ pitch correction, seamless loop, de-interlace auto-detect, multichannel/spatial audio, PiP (with subtitles), Now Playing + remote commands, custom AVIO protocols, adaptive multi-bitrate, low-latency live |
+| **Core** | FFmpeg 9.0 demux/decode all formats, VideoToolbox HW decode + SW fallback, HDR10/HLG/DV Profile 5 & 8, AV1 (dav1d + HW), 8K/120fps capable pipeline, audio/subtitle track selection, libass full ASS rendering, PGS/DVB/VobSub bitmap subs, external subtitle files (SRT/VTT/ASS/SUP), main+secondary subtitles, word-by-word cues, accurate & fast seek, memory cache fast-seek, playback rate w/ pitch correction, seamless loop, de-interlace auto-detect, multichannel/spatial audio, PiP (with subtitles), Now Playing + remote commands, custom AVIO protocols, adaptive multi-bitrate, low-latency live |
 | **Premium UX** | Scrub-preview thumbnails (trickplay), live rewind (time-shift DVR), zero-delay stream switching, disk precache of upcoming content |
 | **Visual** | MetalFX upscaling, brightness/contrast/saturation, HDR10+ dynamic metadata, HDR-rendered subtitles |
 | **Exotic** | 360°/VR panorama, Blu-ray ISO/DVD playback, offline AI subtitles (whisper.cpp), Dolby AC-4 *(investigation — see risks)*, audio passthrough *(investigation)* |
@@ -173,11 +173,11 @@ player.nowPlaying.isEnabled = true   // publishes MPNowPlayingInfoCenter + remot
 
 ---
 
-## 5. FFmpeg 8.1.2 build pipeline (own, in-repo)
+## 5. FFmpeg 9.0.1 build pipeline (own, in-repo)
 
 Modeled on mpvkit/ffmpeg-build's approach but owned by us, under `build/`:
 
-- **Pinned versions manifest** (`build/versions.json`): ffmpeg 8.1.2, dav1d, libass + freetype + harfbuzz + fribidi + libunibreak, (later: libbluray, libdvdread/nav; whisper.cpp ships as a separate SPM dep).
+- **Pinned versions manifest** (`build/versions.json`): ffmpeg 9.0.1, dav1d, libass + freetype + harfbuzz + fribidi + libunibreak, (later: libbluray, libdvdread/nav; whisper.cpp ships as a separate SPM dep).
 - **Config: LGPL** — `--disable-gpl --disable-nonfree --disable-programs --disable-doc --disable-encoders --disable-muxers` (keep a whitelist for HLS/TS demux side), `--enable-videotoolbox --enable-audiotoolbox --enable-securetransport --enable-libdav1d --enable-network`, full decoder/demuxer/protocol set otherwise. Size budget tracked per platform (~25–35 MB/slice expected).
 - **Targets**: iOS arm64 + sim (arm64), tvOS arm64 + sim, macOS arm64 + x86_64, visionOS arm64 + sim. Static libs → per-library **xcframeworks** with clean bundle identifiers and deep macOS layout (App Store-validated — this kills Lume's `fix-ksplayer-frameworks.sh` hack).
 - **Distribution**: GitHub Actions workflow builds, checksums, and attaches artifacts to releases; `Package.swift` consumes them as `binaryTarget(url:checksum:)` with a local-path override for development. *(Implemented as of v0.1.1: the manifest points at the artifact attached to the release that built it, and prefers `BinaryDependencies/FFmpeg.xcframework` whenever that exists. The artifact URL is versioned by the FFmpeg build it contains — it moves only when `versions.json`, the configure flags, or the patches change, not on every engine release.)*
@@ -257,7 +257,7 @@ In the legacy engines, the crash-prone areas are exactly the untested ones. Inve
 
 Phases are sequential milestones; each ends demoable in the DemoApp. (P0–P4 are the critical path to "plays video well"; P5–P7 reach Lume-integration quality; P8 ships it; P9+ are the differentiators.)
 
-- **P0 — Foundations:** repo scaffolding, FFmpeg 8.1.2 build pipeline for all 5 platform slices, SPM binary targets, CI (build + TSan + fixtures), DemoApp shell. *Exit: `avformat_version()` callable from the demo app on every platform.*
+- **P0 — Foundations:** repo scaffolding, FFmpeg build pipeline for all 5 platform slices, SPM binary targets, CI (build + TSan + fixtures), DemoApp shell. *Exit: `avformat_version()` callable from the demo app on every platform.*
 - **P1 — Demux core:** RAII wrappers, channels, Demuxer thread (open/read/seek/interrupt), timestamp unwrapper, typed errors, track model, chapters. *Exit: packet-level inspection of MKV/TS/HLS in demo; wraparound unit tests green.*
 - **P2 — Decode:** video decode with single VT hwaccel path + SW fallback policy, audio decode + swresample negotiation, supervisor + downgrade events. *Exit: decoded-frame dumps correct for the whole fixture matrix.*
 - **P3 — Render & sync:** SystemRenderer (synchronizer + audio/video renderers), session state machine, play/pause/seek(accurate & fast)/rate, buffer controller, first-frame fast path, fit/fill. **DV spike resolved here — P5 is out of scope (§7); P8.1 rides the HDR10 colour-tagging fix.** *Exit: smooth playback incl. HDR fixtures; seek storm test green.*
@@ -280,4 +280,4 @@ Phases are sequential milestones; each ends demoable in the DemoApp. (P0–P4 ar
 2. Zero engine-attributed crashes in a full TestFlight cycle; 24 h live-TS soak with no stall/drift.
 3. All of Lume's legacy-engine workarounds (stream-rebuild hacks, clock-drift and stall watchdogs, stale-state guards, framework-fixing script) become unnecessary for LumeEngine playback.
 4. Feature checklist §2.2 core + premium demonstrably working in DemoApp on all five platforms.
-5. FFmpeg upgrade 8.1.x → next stable executed once via the documented drill in < 1 day of work.
+5. FFmpeg upgrade 8.1.x → next stable executed once via the documented drill in < 1 day of work. *(Met 2026-09-15: 8.1.2 → 9.0.1 — manifest bump, patch re-verified against the new tree, zero engine source changes, suite green.)*

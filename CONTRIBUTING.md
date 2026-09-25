@@ -79,7 +79,7 @@ configure flags in `build/scripts/build-ffmpeg.sh`, or the patch set — otherwi
 would be testing against the released binary rather than your change:
 
 ```bash
-curl -sLo build/ffmpeg-8.1.2.tar.xz https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+curl -sLo build/ffmpeg-9.0.1.tar.xz https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
 build/scripts/build-ffmpeg.sh macos-arm64     # ~10-20 min for one slice
 build/scripts/make-xcframework.sh             # -> BinaryDependencies/FFmpeg.xcframework
 ```
