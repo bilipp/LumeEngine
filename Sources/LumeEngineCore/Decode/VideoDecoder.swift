@@ -119,6 +119,13 @@ public final class VideoDecoder: @unchecked Sendable {
     /// live splice, or the deinterlacer engaging. See `FFmpegRuntime.diagnostics`.
     private var loggedColorSignature: ColorSignature?
 
+    // Dolby Vision IPT reshaping, decode-thread-only. The reshaper is built on
+    // the first IPT-C2 frame, so every other stream never touches Metal.
+    private var dolbyVisionReshaper: DolbyVisionReshaper?
+    private var dolbyVisionReshaperUnavailable = false
+    private var dolbyVisionParameters: DolbyVisionReshapeParameters?
+    private var loggedDolbyVisionOutcome: String?
+
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
@@ -471,9 +478,9 @@ public final class VideoDecoder: @unchecked Sendable {
         // Read off the frame that is actually being delivered — on the
         // deinterlaced path that is the filter's output, so this is what the
         // filter produced rather than what went in.
-        let colorimetry = VideoColorimetry(frame: frame)
+        var colorimetry = VideoColorimetry(frame: frame)
 
-        let pixelBuffer: CVPixelBuffer
+        var pixelBuffer: CVPixelBuffer
         let hardware = frame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue
         if hardware {
             guard let opaque = frame.pointee.data.3 else { return }
@@ -490,6 +497,17 @@ public final class VideoDecoder: @unchecked Sendable {
                 handleDecodeError(nil, error as? EngineError)
                 return
             }
+        }
+
+        // An IPT-C2 base layer (Dolby Vision 5 / 20 / 10.0) is not displayable
+        // on any path until the RPU has been applied — shown as-is it is the
+        // pink/green picture. After this the buffer is ordinary HDR10.
+        var reshaped = false
+        if frame.pointee.colorspace == AVCOL_SPC_IPT_C2,
+           let output = reshapeDolbyVision(frame: frame, pixelBuffer: pixelBuffer) {
+            pixelBuffer = output
+            colorimetry = colorimetry.reshapedToHDR10()
+            reshaped = true
         }
 
         // Which of the three paths produced this buffer is the whole point of
@@ -515,11 +533,55 @@ public final class VideoDecoder: @unchecked Sendable {
             pts: pts,
             duration: duration,
             serial: serial,
-            isHardwareDecoded: hardware,
+            isHardwareDecoded: hardware && !reshaped,
             colorimetry: colorimetry
         )
         // Blocking send = backpressure; closed output (teardown) just drops.
         try? output.send(videoFrame)
+    }
+
+    /// `nil` means "deliver the frame untouched": no Metal, no RPU seen yet,
+    /// or a GPU failure. Each outcome is logged once per change, so a stream
+    /// that stays tinted says why.
+    private func reshapeDolbyVision(
+        frame: UnsafeMutablePointer<AVFrame>,
+        pixelBuffer: CVPixelBuffer
+    ) -> CVPixelBuffer? {
+        // The RPU is per frame, but a frame without one keeps the last
+        // recipe rather than flashing to IPT.
+        if let parameters = DolbyVisionReshapeParameters(frame: frame) {
+            dolbyVisionParameters = parameters
+        }
+        guard let parameters = dolbyVisionParameters else {
+            logDolbyVisionOutcome("skipped reason=no-rpu")
+            return nil
+        }
+        if dolbyVisionReshaper == nil, !dolbyVisionReshaperUnavailable {
+            dolbyVisionReshaper = DolbyVisionReshaper()
+            dolbyVisionReshaperUnavailable = dolbyVisionReshaper == nil
+        }
+        guard let reshaper = dolbyVisionReshaper else {
+            logDolbyVisionOutcome("skipped reason=metal-unavailable")
+            return nil
+        }
+        do {
+            let output = try reshaper.reshape(pixelBuffer, parameters: parameters)
+            logDolbyVisionOutcome(
+                "applied input=\(Self.fourCC(CVPixelBufferGetPixelFormatType(pixelBuffer)))"
+                    + " output=\(Self.fourCC(CVPixelBufferGetPixelFormatType(output)))"
+            )
+            return output
+        } catch {
+            logDolbyVisionOutcome("failed error=\(error)")
+            return nil
+        }
+    }
+
+    private func logDolbyVisionOutcome(_ outcome: String) {
+        guard loggedDolbyVisionOutcome != outcome else { return }
+        loggedDolbyVisionOutcome = outcome
+        let message = "dv-reshape \(outcome) codec=\(parameters.codecName)"
+        FFmpegRuntime.diagnostics.notice("\(message, privacy: .public)")
     }
 
     private func drainCodec(into frame: UnsafeMutablePointer<AVFrame>, emitEOFSerial serial: UInt64?) {
