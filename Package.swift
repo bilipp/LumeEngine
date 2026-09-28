@@ -68,6 +68,7 @@ let ffmpegLinkerSettings: [LinkerSetting] = [
     .linkedFramework("CoreMedia"),
     .linkedFramework("CoreVideo"),
     .linkedFramework("VideoToolbox"),
+    .linkedFramework("Metal"),
     .linkedFramework("AudioToolbox"),
     .linkedFramework("Security"),
 ]

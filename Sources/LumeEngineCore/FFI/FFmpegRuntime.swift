@@ -79,3 +79,25 @@ private func ffmpegLogCallback(
     guard !message.isEmpty else { return }
     FFmpegRuntime.log(level: level, message: message)
 }
+
+extension FFmpegRuntime {
+    /// Stream-open diagnostics channel — the same `os_log` facility the FFmpeg
+    /// bridge above uses, one category further along so a measurement pass can
+    /// isolate it:
+    ///
+    /// ```
+    /// log stream --predicate 'subsystem == "engine.lume" && category == "diagnostics"'
+    /// ```
+    ///
+    /// Everything written here is emitted **once per stream open** (and again
+    /// only when the thing being described actually changes). Nothing on this
+    /// channel may be written per frame or per tick: the video path reaches it
+    /// from inside `deliver()`, which runs 50–120 times a second on a 4K
+    /// stream, so a caller must have compared a cheap value-type signature
+    /// *before* formatting anything.
+    ///
+    /// Level convention follows `FFmpegRuntime.log`: `.notice` for the
+    /// once-per-stream facts (persisted, so they survive into `log collect`
+    /// from an Apple TV), `.error`/`.warning` reserved for failures.
+    static let diagnostics = Logger(subsystem: "engine.lume", category: "diagnostics")
+}
