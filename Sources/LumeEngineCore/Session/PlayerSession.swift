@@ -477,6 +477,11 @@ public actor PlayerSession {
 
     /// Stops everything. Bounded, idempotent, safe at any point of the lifecycle.
     public func shutdown() {
+        // An `open` still waiting on the demuxer would never hear back once the pump
+        // tasks below are cancelled (its .openFailed event is never delivered), leaving
+        // the caller and this session suspended for good. End it here instead.
+        openContinuation?.resume(throwing: EngineError(code: .cancelled, message: "Session shut down while opening"))
+        openContinuation = nil
         monitorTask?.cancel()
         monitorTask = nil
         renderer.shutdown()
