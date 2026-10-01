@@ -22,6 +22,10 @@ public final class SystemRenderer: @unchecked Sendable {
     // default QoS they get descheduled on loaded devices (see Demuxer.start).
     private let videoQueue = DispatchQueue(label: "engine.lume.render.video", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "engine.lume.render.audio", qos: .userInteractive)
+    /// How long a starved pump waits before asking for data again. This is
+    /// the only latency a frame that lands in an empty channel picks up, so
+    /// keep it well under a frame interval at 50/60 fps.
+    private let starvationRetryMilliseconds = 10
 
     // Guarded by `lock`.
     private let lock = NSLock()
@@ -35,6 +39,9 @@ public final class SystemRenderer: @unchecked Sendable {
     private var videoPumpScheduled = false
     private var audioPumpScheduled = false
     private var stopped = false
+    // How often each pump has run. Read through `pumpCounts`.
+    private var videoPumpCount = 0
+    private var audioPumpCount = 0
 
     // Queue-confined format caches.
     private var videoFormatCache: CMVideoFormatDescription?
@@ -100,9 +107,7 @@ public final class SystemRenderer: @unchecked Sendable {
             lock.lock()
             videoObservation = observation
             lock.unlock()
-            videoRenderer.requestMediaDataWhenReady(on: videoQueue) { [weak self] in
-                self?.pumpVideo()
-            }
+            videoQueue.async { [weak self] in self?.armVideo() }
         }
 
         if audio != nil {
@@ -115,9 +120,7 @@ public final class SystemRenderer: @unchecked Sendable {
             lock.lock()
             audioObservation = observation
             lock.unlock()
-            audioRenderer.requestMediaDataWhenReady(on: audioQueue) { [weak self] in
-                self?.pumpAudio()
-            }
+            audioQueue.async { [weak self] in self?.armAudio() }
         } else if audioWasAttached {
             detachAudioRenderer()
         }
@@ -259,19 +262,67 @@ public final class SystemRenderer: @unchecked Sendable {
 
     // MARK: Pumps (render queues)
 
-    /// Feeds the video renderer. `requestMediaDataWhenReady` only re-fires on
-    /// readiness transitions, so on starvation we self-schedule a retry — the
-    /// pump never silently stops (the classic "spinner stuck forever" failure, PLAN.md §3.3).
+    // `requestMediaDataWhenReady` is not edge-triggered: for as long as the
+    // renderer stays ready, AVFoundation calls the block again the moment it
+    // returns. A pump that returns early because it has nothing to enqueue
+    // would therefore spin — millions of calls a second, a whole core per lane
+    // at userInteractive. Live TV is that state almost all the time: frames
+    // arrive in real time, so the renderer never fills up. So a starved pump
+    // stops requesting and its retry re-arms, and a pump with no lane
+    // (detached or shut down) stops requesting without re-arming.
+    //
+    // Arming always happens on the lane's queue, the queue the pump stops
+    // requesting on. That orders the two: a track switch that detaches and
+    // re-attaches audio can't have its fresh request cancelled by a pump that
+    // was still running against the old, detached lane.
+
+    /// Lane-queue-confined.
+    private func armVideo() {
+        lock.lock()
+        let live = videoLaneAttached && !stopped
+        lock.unlock()
+        guard live else { return }
+        videoRenderer.requestMediaDataWhenReady(on: videoQueue) { [weak self] in
+            self?.pumpVideo()
+        }
+    }
+
+    /// Lane-queue-confined.
+    private func armAudio() {
+        lock.lock()
+        let live = audioLaneAttached && !stopped
+        lock.unlock()
+        guard live else { return }
+        audioRenderer.requestMediaDataWhenReady(on: audioQueue) { [weak self] in
+            self?.pumpAudio()
+        }
+    }
+
+    /// How many times each pump has run — what a starvation spin inflates.
+    var pumpCounts: (video: Int, audio: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (videoPumpCount, audioPumpCount)
+    }
+
+    /// Feeds the video renderer. On starvation it stops requesting and
+    /// self-schedules a re-arm, so the pump never silently stops (the classic
+    /// "spinner stuck forever" failure, PLAN.md §3.3) and never spins either.
     private func pumpVideo() {
         lock.lock()
         let input = videoInput
         let serial = acceptedSerial
         let isStopped = stopped
+        videoPumpCount += 1
         lock.unlock()
-        guard let input, !isStopped else { return }
+        guard let input, !isStopped else {
+            videoRenderer.stopRequestingMediaData()
+            return
+        }
 
         while videoRenderer.isReadyForMoreMediaData {
             guard let frame = input.tryReceive() else {
+                videoRenderer.stopRequestingMediaData()
                 scheduleVideoRetry()
                 return
             }
@@ -294,11 +345,16 @@ public final class SystemRenderer: @unchecked Sendable {
         let input = audioInput
         let serial = acceptedSerial
         let isStopped = stopped
+        audioPumpCount += 1
         lock.unlock()
-        guard let input, !isStopped else { return }
+        guard let input, !isStopped else {
+            audioRenderer.stopRequestingMediaData()
+            return
+        }
 
         while audioRenderer.isReadyForMoreMediaData {
             guard let frame = input.tryReceive() else {
+                audioRenderer.stopRequestingMediaData()
                 scheduleAudioRetry()
                 return
             }
@@ -326,12 +382,12 @@ public final class SystemRenderer: @unchecked Sendable {
         if shouldSchedule { videoPumpScheduled = true }
         lock.unlock()
         guard shouldSchedule else { return }
-        videoQueue.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
+        videoQueue.asyncAfter(deadline: .now() + .milliseconds(starvationRetryMilliseconds)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
             self.videoPumpScheduled = false
             self.lock.unlock()
-            self.pumpVideo()
+            self.armVideo()
         }
     }
 
@@ -341,12 +397,12 @@ public final class SystemRenderer: @unchecked Sendable {
         if shouldSchedule { audioPumpScheduled = true }
         lock.unlock()
         guard shouldSchedule else { return }
-        audioQueue.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
+        audioQueue.asyncAfter(deadline: .now() + .milliseconds(starvationRetryMilliseconds)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
             self.audioPumpScheduled = false
             self.lock.unlock()
-            self.pumpAudio()
+            self.armAudio()
         }
     }
 }
