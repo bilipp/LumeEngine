@@ -40,6 +40,13 @@ public final class LumePlayer {
         }
     }
 
+    /// Output volume, 0...1, applied on top of the system volume. Kept across
+    /// `load`, so a host can open a stream silent and ramp it up: audio that
+    /// starts (or stops) mid-waveform at full level is heard as a click.
+    public var volume: Float = 1.0 {
+        didSet { session?.renderer.volume = volume }
+    }
+
     /// Present this layer via `LumePlayerView` (SwiftUI) or add it to a view's
     /// layer tree directly (UIKit/AppKit).
     public var displayLayer: LumeDisplayLayer? { session?.renderer.displayLayer }
@@ -62,6 +69,7 @@ public final class LumePlayer {
 
         let session = PlayerSession(configuration: configuration)
         self.session = session
+        session.renderer.volume = volume
         state = .opening
 
         eventTask = Task { [events = session.events] in
