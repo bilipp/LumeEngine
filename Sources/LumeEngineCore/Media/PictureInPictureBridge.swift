@@ -17,6 +17,12 @@ public final class PictureInPictureBridge: NSObject {
 
     public private(set) var isActive = false
 
+    /// Called on the main actor each time `isActive` changes, including for
+    /// changes the host didn't ask for: the system starting PiP on its own, or
+    /// the user closing the window with its ✕. Lets the host mirror the state
+    /// (button glyph, background policy) and end playback on a dismissal.
+    public var onActiveChange: ((Bool) -> Void)?
+
     public init(session: PlayerSession, mediaInfo: MediaInfo) {
         self.session = session
         self.renderer = session.renderer
@@ -48,6 +54,12 @@ public final class PictureInPictureBridge: NSObject {
     public func toggle() {
         isActive ? stop() : start()
     }
+
+    private func setActive(_ active: Bool) {
+        guard isActive != active else { return }
+        isActive = active
+        onActiveChange?(active)
+    }
 }
 
 // Delegate callbacks are nonisolated protocol requirements; AVKit delivers
@@ -56,20 +68,20 @@ extension PictureInPictureBridge: AVPictureInPictureControllerDelegate {
     public nonisolated func pictureInPictureControllerDidStartPictureInPicture(
         _ controller: AVPictureInPictureController
     ) {
-        MainActor.assumeIsolated { isActive = true }
+        MainActor.assumeIsolated { setActive(true) }
     }
 
     public nonisolated func pictureInPictureControllerDidStopPictureInPicture(
         _ controller: AVPictureInPictureController
     ) {
-        MainActor.assumeIsolated { isActive = false }
+        MainActor.assumeIsolated { setActive(false) }
     }
 
     public nonisolated func pictureInPictureController(
         _ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        MainActor.assumeIsolated { isActive = false }
+        MainActor.assumeIsolated { setActive(false) }
     }
 }
 

@@ -1,3 +1,4 @@
+import AVKit
 import Foundation
 import MediaPlayer
 import Testing
@@ -58,6 +59,37 @@ struct PlatformIntegrationTests {
         _ = bridge.isSupported
         _ = bridge.isPossible
         bridge.stop() // no-op when unsupported/inactive
+
+        await session.shutdown()
+    }
+
+    @Test(
+        "PiP bridge reports each state change once",
+        .enabled(if: AVPictureInPictureController.isPictureInPictureSupported()),
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func pipBridgeActiveChanges() async throws {
+        var configuration = PlayerConfiguration()
+        configuration.muted = true
+        let session = PlayerSession(configuration: configuration)
+        let info = try await session.open(url: try Fixtures.path("basic.mp4"))
+        let bridge = PictureInPictureBridge(session: session, mediaInfo: info)
+        var changes: [Bool] = []
+        bridge.onActiveChange = { changes.append($0) }
+
+        // Drive the delegate the way AVKit does: a system-started PiP, then the
+        // window closed with its ✕ (a stop the bridge never requested).
+        let controller = AVPictureInPictureController(
+            contentSource: .init(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(), playbackDelegate: bridge)
+        )
+        bridge.pictureInPictureControllerDidStartPictureInPicture(controller)
+        #expect(bridge.isActive)
+        bridge.pictureInPictureControllerDidStopPictureInPicture(controller)
+        bridge.pictureInPictureController(controller, failedToStartPictureInPictureWithError: CancellationError())
+
+        #expect(!bridge.isActive)
+        #expect(changes == [true, false])
 
         await session.shutdown()
     }
