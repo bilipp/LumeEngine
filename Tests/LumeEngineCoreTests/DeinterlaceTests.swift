@@ -17,6 +17,10 @@ struct DeinterlaceTests {
         var wasFiltering = false
         /// Whether the codec itself ran on VideoToolbox.
         var hardwareDecode = false
+        /// Pixel aspect ratios the buffers were tagged with ("h:v", "none").
+        var pixelAspects: Set<String> = []
+        /// YCbCr matrices the buffers were tagged with ("none" when untagged).
+        var matrices: Set<String> = []
 
         var frameCount: Int { pts.count }
         /// Gaps between consecutive presentation times, engine µs.
@@ -66,6 +70,16 @@ struct DeinterlaceTests {
             collected.zeroCopy.insert(frame.isHardwareDecoded)
             collected.wasFiltering = collected.wasFiltering || decoder.isDeinterlacing
             collected.hardwareDecode = collected.hardwareDecode || decoder.isHardwareActive
+            let buffer = frame.pixelBuffer
+            if let aspect = CVBufferCopyAttachment(buffer, kCVImageBufferPixelAspectRatioKey, nil) as? [String: Any],
+               let horizontal = aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? Int,
+               let vertical = aspect[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? Int {
+                collected.pixelAspects.insert("\(horizontal):\(vertical)")
+            } else {
+                collected.pixelAspects.insert("none")
+            }
+            let matrix = CVBufferCopyAttachment(buffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
+            collected.matrices.insert(matrix ?? "none")
         }
 
         while let event = await demuxEvents.next() {
@@ -89,6 +103,17 @@ struct DeinterlaceTests {
         decoder.shutdown() // closes the frame channel; the drain ends on that
 
         return await collector.value
+    }
+
+    @Test("deinterlaced buffers keep the pixel aspect and get SD colour", .timeLimit(.minutes(1)))
+    func anamorphicSD() async throws {
+        // 720x576 at 64:45 is a 16:9 picture; untagged, the layer shows it 5:4.
+        // The stream carries no colour description, and SD is BT.601.
+        let result = try await decodeAll(fixture: "anamorphic.ts", deinterlacing: VideoDecoder.Deinterlacing())
+        #expect(result.wasFiltering, "the fixture is interlaced and must go through the filter")
+        #expect(result.frameCount > 0)
+        #expect(result.pixelAspects == ["64:45"], "got \(result.pixelAspects)")
+        #expect(result.matrices == [kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String], "got \(result.matrices)")
     }
 
     @Test("off: interlaced content passes through untouched", .timeLimit(.minutes(1)))

@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import Foundation
 import Testing
 @testable import LumeEngineCore
@@ -136,6 +137,34 @@ struct PlayerSessionTests {
         #expect(playing, "session must reach .playing from a start position")
         let position = await session.position
         #expect(position > 6.0 && position < 9.5, "expected playback near 7 s, got \(position)")
+        await session.shutdown()
+    }
+
+    @Test("audio the renderer drops on its own is enqueued again", .timeLimit(.minutes(1)))
+    func automaticAudioFlush() async throws {
+        let session = makeSession()
+        _ = try await session.open(url: try Fixtures.path("basic.mp4"))
+        await session.play()
+        _ = await eventually { await session.position > 1 }
+
+        // What a route change does: the renderer drops its queue and says so.
+        // The clock keeps running.
+        let renderer = session.renderer
+        let flushTime = SampleBufferBuilder.time(renderer.currentTime)
+        renderer.audioRenderer.flush()
+        NotificationCenter.default.post(
+            name: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer.audioRenderer,
+            userInfo: [AVSampleBufferAudioRendererFlushTimeKey: NSValue(time: flushTime)]
+        )
+
+        let answered = await eventually(timeout: 5) { renderer.automaticAudioFlushes == 1 }
+        #expect(answered, "the automatic flush must be answered")
+        #expect(renderer.audioRenderer.status != .failed)
+        let before = await session.position
+        let advanced = await eventually { await session.position > before + 1 }
+        #expect(advanced, "playback must continue after the refill")
+        #expect(await session.state == .playing)
         await session.shutdown()
     }
 

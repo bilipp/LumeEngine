@@ -16,7 +16,7 @@ public final class SystemRenderer: @unchecked Sendable {
 
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let videoRenderer: AVSampleBufferVideoRenderer
-    private let audioRenderer = AVSampleBufferAudioRenderer()
+    let audioRenderer = AVSampleBufferAudioRenderer()
 
     // Data-plane queues: the pumps feed the renderers on a deadline — at
     // default QoS they get descheduled on loaded devices (see Demuxer.start).
@@ -41,6 +41,26 @@ public final class SystemRenderer: @unchecked Sendable {
     private var audioFormatCache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
     // Audio-queue-confined; serial changes re-anchor it after a seek flush.
     private var audioTimeline = AudioTimeline()
+
+    /// Audio enqueued but not yet played, kept so it can be enqueued again
+    /// after the renderer drops it on its own (see `refillAfterAutomaticFlush`).
+    /// Audio-queue-confined.
+    private struct RetainedAudio {
+        let sample: CMSampleBuffer
+        let serial: UInt64
+        /// End of the sample on the engine timeline (µs).
+        let end: Int64
+    }
+    private var retainedAudio: [RetainedAudio] = []
+    /// Backstop only: the renderer stops asking for audio once it holds a
+    /// second or two, so the retention stays that size even while paused.
+    private static let maxRetainedAudio = 1024
+    /// Automatic audio flushes (and output reconfigurations) answered by
+    /// re-enqueueing. Guarded by `lock`.
+    var automaticAudioFlushes: Int { lock.withLock { automaticAudioFlushCount } }
+    private var automaticAudioFlushCount = 0
+    /// Notification tokens, removed on shutdown. Guarded by `lock`.
+    private var notificationTokens: [NSObjectProtocol] = []
 
     /// Fires (once per lane) when a renderer transitions to `.failed` — e.g.
     /// an audio format the output route cannot render. A failed renderer
@@ -73,6 +93,82 @@ public final class SystemRenderer: @unchecked Sendable {
         // failure event. Multi-View plays up to four sources at once, so an
         // audio-less tile must hold no claim at all.
         synchronizer.setRate(0, time: .zero)
+        observeSystemNotifications()
+    }
+
+    deinit {
+        for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
+    }
+
+    /// The audio renderer drops everything it holds when the output route
+    /// changes (AirPlay, HomePod, AirPods, HDMI) and when the synchronizer's
+    /// rate changes between two non-zero values. The clock keeps running, so
+    /// without an answer the dropped stretch plays as silence. Media services
+    /// being reset invalidates every renderer for good, which only a new
+    /// session can recover from.
+    private func observeSystemNotifications() {
+        // Both notifications are deprecated as of the OS 27 SDKs in favour of
+        // the renderer's Receiver API, which the iOS/tvOS 18 floor predates.
+        let center = NotificationCenter.default
+        var tokens = [center.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: audioRenderer,
+            queue: nil
+        ) { [weak self] notification in
+            // Plain µs out of the notification before hopping queues (the
+            // notification itself is not Sendable).
+            let value = notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue
+            let flushTime = value.map { $0.timeValue }
+            let micros = flushTime.flatMap { $0.isValid ? $0.convertScale(SampleBufferBuilder.timescale, method: .default).value : nil }
+            guard let self else { return }
+            self.audioQueue.async { self.refillAfterAutomaticFlush(from: micros ?? self.currentTime) }
+        }, center.addObserver(
+            // The output hardware was reconfigured for another client's format
+            // (an HDMI or HomePod route renegotiating): the renderer keeps
+            // playing, suboptimally, until it is flushed and fed again from the
+            // playhead, which configures the hardware for this stream.
+            forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
+            object: audioRenderer,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.audioQueue.async { self.refillAfterAutomaticFlush(from: self.currentTime) }
+        }]
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        tokens.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.reportRenderFailure(lane: "audio", underlying: nil, reason: "media services were reset")
+        })
+        #endif
+        lock.withLock { notificationTokens = tokens }
+    }
+
+    /// Answers an automatic flush: re-enqueue what was dropped, from the time
+    /// the renderer flushed at. Runs on the audio queue, so no pump pass runs
+    /// alongside it.
+    func refillAfterAutomaticFlush(from flushTime: Int64) {
+        lock.lock()
+        let serial = acceptedSerial
+        let active = !stopped && audioLaneAttached
+        if active { automaticAudioFlushCount += 1 }
+        lock.unlock()
+        guard active else { return }
+
+        // A pump pass may have enqueued between the automatic flush and this
+        // answer; that audio is retained too, so drop it and re-enqueue
+        // everything in order.
+        audioRenderer.flush()
+        for entry in retainedAudio where entry.serial == serial && (!MediaTime.isValid(flushTime) || entry.end > flushTime) {
+            audioRenderer.enqueue(entry.sample)
+        }
+        // A seek that flushed while this ran may have been overtaken by the
+        // re-enqueue; its audio belongs to the old position.
+        if lock.withLock({ acceptedSerial }) != serial {
+            audioRenderer.flush()
+        }
     }
 
     // MARK: Wiring
@@ -84,6 +180,7 @@ public final class SystemRenderer: @unchecked Sendable {
     /// audio does not re-observe or re-request on a renderer already running.
     public func attach(video: Channel<VideoFrame>?, audio: Channel<AudioFrame>?) {
         lock.lock()
+        let audioChanged = audioInput !== audio
         videoInput = video
         audioInput = audio
         let videoWasAttached = videoLaneAttached
@@ -91,6 +188,12 @@ public final class SystemRenderer: @unchecked Sendable {
         videoLaneAttached = video != nil
         audioLaneAttached = audio != nil
         lock.unlock()
+
+        if audioChanged {
+            // Retained audio belongs to the lane that enqueued it; a refill
+            // after a track switch must not bring the old track back.
+            audioQueue.async { [weak self] in self?.retainedAudio.removeAll() }
+        }
 
         if video != nil, !videoWasAttached {
             let observation = videoRenderer.observe(\.status, options: [.initial, .new]) { [weak self] renderer, _ in
@@ -140,13 +243,13 @@ public final class SystemRenderer: @unchecked Sendable {
         synchronizer.removeRenderer(audioRenderer, at: now.isValid ? now : .zero)
     }
 
-    private func reportRenderFailure(lane: String, underlying: Error?) {
+    private func reportRenderFailure(lane: String, underlying: Error?, reason: String? = nil) {
         lock.lock()
         let alreadyReported = reportedFailure || stopped
         reportedFailure = true
         lock.unlock()
         guard !alreadyReported else { return }
-        let detail = underlying.map { " — \($0.localizedDescription)" } ?? ""
+        let detail = (reason ?? underlying?.localizedDescription).map { " — \($0)" } ?? ""
         onRenderFailure?(EngineError(
             code: .renderFailed,
             message: "\(lane) renderer failed\(detail)"
@@ -248,8 +351,11 @@ public final class SystemRenderer: @unchecked Sendable {
         audioObservation = nil
         videoLaneAttached = false
         audioLaneAttached = false
+        let tokens = notificationTokens
+        notificationTokens = []
         lock.unlock()
         observations.forEach { $0.invalidate() }
+        for token in tokens { NotificationCenter.default.removeObserver(token) }
         videoRenderer.stopRequestingMediaData()
         audioRenderer.stopRequestingMediaData()
         synchronizer.setRate(0, time: .zero)
@@ -314,10 +420,21 @@ public final class SystemRenderer: @unchecked Sendable {
                 lastEnqueuedAudioPTS = frame.pts + frame.duration
                 if !MediaTime.isValid(firstEnqueuedAudioPTS) { firstEnqueuedAudioPTS = frame.pts }
                 lock.unlock()
+                retainAudio(sample, serial: serial, end: frame.pts + frame.duration)
             } catch {
                 continue
             }
         }
+    }
+
+    /// Keeps `sample` until the clock has played past it. Audio queue only.
+    private func retainAudio(_ sample: CMSampleBuffer, serial: UInt64, end: Int64) {
+        let now = currentTime
+        retainedAudio.removeAll { entry in
+            entry.serial != serial || (MediaTime.isValid(now) && entry.end <= now)
+        }
+        if retainedAudio.count >= Self.maxRetainedAudio { retainedAudio.removeFirst() }
+        retainedAudio.append(RetainedAudio(sample: sample, serial: serial, end: end))
     }
 
     private func scheduleVideoRetry() {

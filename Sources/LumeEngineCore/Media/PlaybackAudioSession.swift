@@ -4,7 +4,8 @@ import Foundation
 
 /// iOS/tvOS/visionOS audio session lifecycle for playback: category setup,
 /// interruption handling (phone call → pause, resume when the system says so),
-/// and route-change handling (headphones unplugged → pause).
+/// route-change handling (headphones unplugged → pause), and recovery from a
+/// media-services reset.
 ///
 /// Engine-owned (rather than left to the app) so every consumer gets correct
 /// behavior out of the box.
@@ -13,8 +14,12 @@ public final class PlaybackAudioSession {
     public struct Callbacks: Sendable {
         /// Interruption began or output route disappeared: pause now.
         public var pauseRequested: @MainActor @Sendable () -> Void = {}
-        /// Interruption ended with `.shouldResume`.
+        /// Interruption ended with `.shouldResume`; the session is active again.
         public var resumeAllowed: @MainActor @Sendable () -> Void = {}
+        /// The media server restarted. Every audio and video object from
+        /// before is dead, renderers included: open a new player session. The
+        /// audio session itself has been set up again by the time this runs.
+        public var mediaServicesReset: @MainActor @Sendable () -> Void = {}
         public init() {}
     }
 
@@ -44,6 +49,10 @@ public final class PlaybackAudioSession {
                     callbacks.pauseRequested()
                 case .ended:
                     if AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume) {
+                        // The interruption deactivated the session. Resuming
+                        // the clock on an inactive session leaves the render
+                        // synchronizer frozen: the rate is set and nothing moves.
+                        try? AVAudioSession.sharedInstance().setActive(true)
                         callbacks.resumeAllowed()
                     }
                 @unknown default:
@@ -60,6 +69,17 @@ public final class PlaybackAudioSession {
                 if reason == .oldDeviceUnavailable {
                     callbacks.pauseRequested() // headphones yanked: never blast the room
                 }
+            }
+        })
+        observers.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                // The reset also discarded the category and the activation.
+                let session = AVAudioSession.sharedInstance()
+                try? session.setCategory(.playback, mode: .moviePlayback)
+                try? session.setActive(true)
+                callbacks.mediaServicesReset()
             }
         })
     }

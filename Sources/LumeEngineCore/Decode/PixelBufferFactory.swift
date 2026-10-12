@@ -5,7 +5,9 @@ import CoreVideo
 /// 8-bit, P010 for higher bit depths) via swscale. The hardware path never
 /// touches this — VideoToolbox frames are already `CVPixelBuffer`s (zero-copy,
 /// PLAN.md §7 "no sws_scale on the hot path" applies to HW-decodable content;
-/// this factory exists for the exotic-format software fallback).
+/// this factory exists for the software fallback and for deinterlacer output).
+/// Buffers leave tagged with the frame's colour and pixel aspect ratio (see
+/// `PixelBufferAttachments`).
 final class PixelBufferFactory {
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
@@ -35,6 +37,7 @@ final class PixelBufferFactory {
 
         let buffer = try dequeueBuffer(width: width, height: height, format: targetCV)
         try convert(frame: frame, from: sourceFormat, to: targetFFmpeg, into: buffer, width: width, height: height)
+        PixelBufferAttachments.apply(from: frame, to: buffer)
         return buffer
     }
 

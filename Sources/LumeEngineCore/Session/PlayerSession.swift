@@ -384,6 +384,9 @@ public actor PlayerSession {
         /// Total compressed bytes demuxed — diff across heartbeats for the
         /// effective delivery rate.
         public let deliveredBytes: Int64
+        /// Timestamp discontinuities folded out of the timeline (encoder
+        /// restarts, chunk seams) since open.
+        public let timelineSeams: Int
 
         public var description: String {
             func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
@@ -398,14 +401,15 @@ public actor PlayerSession {
             if let error = rendererHealth.videoError { health += " vErr(\(error))" }
             if let error = rendererHealth.audioError { health += " aErr(\(error))" }
             return String(
-                format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB",
+                format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB seams=%ld",
                 state, playheadSeconds,
                 lane(videoQueue, lead: videoLeadSeconds, first: videoFirstSeconds),
                 packets(videoPacketQueue),
                 lane(audioQueue, lead: audioLeadSeconds, first: audioFirstSeconds),
                 packets(audioPacketQueue),
                 health, demuxAtEOF ? "yes" : "no",
-                Double(deliveredBytes) / 1_048_576
+                Double(deliveredBytes) / 1_048_576,
+                timelineSeams
             )
         }
     }
@@ -435,7 +439,8 @@ public actor PlayerSession {
             audioFirstSeconds: MediaTime.isValid(lowWater.audio) ? MediaTime.seconds(lowWater.audio) : -1,
             rendererHealth: renderer.rendererHealth,
             demuxAtEOF: demuxAtEOF,
-            deliveredBytes: demuxer?.deliveredBytes ?? 0
+            deliveredBytes: demuxer?.deliveredBytes ?? 0,
+            timelineSeams: demuxer?.timelineSeams ?? 0
         )
     }
 
@@ -645,10 +650,7 @@ public actor PlayerSession {
             break // transient; the demuxer keeps reading
 
         case .failed(let error):
-            lastError = error
-            state = .failed
-            renderer.setRate(0)
-            eventSink.yield(.error(error))
+            failSession(error)
 
         case .closed:
             break
@@ -661,8 +663,14 @@ public actor PlayerSession {
     /// (engine fallback, retry) is the app's job.
     private func handleRenderFailure(_ error: EngineError) {
         guard state != .failed, state != .idle else { return }
+        failSession(error)
+    }
+
+    /// Terminal failure: stop the clock and report the typed reason.
+    private func failSession(_ error: EngineError) {
         lastError = error
         state = .failed
+        shouldPlay = false
         renderer.setRate(0)
         eventSink.yield(.error(error))
     }
@@ -805,6 +813,18 @@ public actor PlayerSession {
             let highWater = renderer.enqueuedHighWaterMark
             let mark = max(highWater.video, highWater.audio)
             if !MediaTime.isValid(mark) || renderer.currentTime >= mark {
+                if info?.isLive == true {
+                    // A live source has no end: reaching one means the source
+                    // was lost. What was buffered has played out by now, so
+                    // the viewer saw everything that arrived; report it as a
+                    // failure, or the channel would sit on its last frame in
+                    // `.ended` with nothing telling the app to reconnect.
+                    failSession(EngineError(
+                        code: .sourceEnded,
+                        message: "live source reached end of stream"
+                    ))
+                    return
+                }
                 if state != .ended {
                     renderer.setRate(0)
                     state = .ended

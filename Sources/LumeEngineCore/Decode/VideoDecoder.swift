@@ -5,10 +5,10 @@ import VideoToolbox
 
 /// Events emitted by decoders on their own threads.
 public enum DecodeEvent: Sendable {
-    /// Frames now come from software decoding: either hardware decoding failed
-    /// mid-stream and the decoder rebuilt itself in software (continuing from
-    /// the next keyframe), or VideoToolbox refused the stream and FFmpeg fell
-    /// back on its own. Informational.
+    /// Frames now come from software decoding: either hardware decoding kept
+    /// failing mid-stream and the decoder rebuilt itself in software
+    /// (continuing from the next keyframe), or VideoToolbox refused the stream
+    /// and FFmpeg fell back on its own. Informational.
     case downgradedToSoftware(EngineError)
     /// The codec has been fully drained for the given serial.
     case endOfStream(serial: UInt64)
@@ -20,9 +20,11 @@ public enum DecodeEvent: Sendable {
 ///
 /// One hardware path only (PLAN.md §3.5): FFmpeg-managed VideoToolbox via
 /// `get_format` + `av_hwdevice_ctx_create`. One recovery policy: on hardware
-/// error, rebuild in software, emit `.downgradedToSoftware`, resume at the next
-/// keyframe. Software decode errors are tolerated (corrupt packets must not
-/// kill the pipeline — PLAN.md §3.3) until a consecutive-error limit.
+/// error, flush and resume at the next keyframe, still in hardware; only when
+/// hardware keeps failing (`HardwareFailureBudget`) rebuild in software, emit
+/// `.downgradedToSoftware`, and resume at the next keyframe. Software decode
+/// errors are tolerated (corrupt packets must not kill the pipeline — PLAN.md
+/// §3.3) until a consecutive-error limit.
 public final class VideoDecoder: @unchecked Sendable {
     public enum HardwarePolicy: Sendable {
         /// Try VideoToolbox, fall back to software automatically.
@@ -105,6 +107,7 @@ public final class VideoDecoder: @unchecked Sendable {
     private var currentSerial: UInt64?
     private var waitingForKeyframe = false
     private var consecutiveErrors = 0
+    private var hardwareFailures = HardwareFailureBudget()
     private let pixelFactory = PixelBufferFactory()
 
     // Deinterlace state, decode-thread-only.
@@ -364,6 +367,7 @@ public final class VideoDecoder: @unchecked Sendable {
                 return
             }
             consecutiveErrors = 0
+            if usingHardware { hardwareFailures.recordFrame() }
             noteFrameSource(frame)
             emit(frame: frame)
             av_frame_unref(frame)
@@ -681,7 +685,19 @@ public final class VideoDecoder: @unchecked Sendable {
         } ?? EngineError(code: .decodeFailed, message: "video decode failed")
 
         if usingHardware {
-            // ONE fallback policy: rebuild software, resume at next keyframe.
+            if !hardwareFailures.recordFailure(at: ProcessInfo.processInfo.systemUptime) {
+                // Stay in hardware: drop what the codec holds and resync at the
+                // next keyframe. A session VideoToolbox invalidated is rebuilt
+                // by FFmpeg on the next frame it decodes.
+                avcodec_flush_buffers(codecContext)
+                waitingForKeyframe = true
+                // The deinterlacer holds fields from before the gap; blending
+                // them into the first frame after it would smear the resync.
+                filterGraph = nil
+                return
+            }
+            // Hardware keeps failing: rebuild in software, resume at the next
+            // keyframe.
             teardownCodec()
             if setupCodec(hardware: false) {
                 waitingForKeyframe = true
