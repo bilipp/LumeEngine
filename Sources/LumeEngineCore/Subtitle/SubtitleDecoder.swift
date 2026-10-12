@@ -7,7 +7,8 @@ import Foundation
 /// so does the closed-caption lane, whose packets come from the video decoder
 /// (`ClosedCaptionTap`) rather than the demuxer. Each decoded update goes to
 /// the store as a `SubtitleEvent`; how long it shows is the store's policy.
-/// Bitmap codecs (PGS/DVB/VobSub) are recognized but skipped for now.
+/// Bitmap codecs (DVB, PGS, VobSub) produce cues with `images` instead of
+/// text (`SubtitleBitmap`).
 public final class SubtitleDecoder: @unchecked Sendable {
     public let store: SubtitleStore
 
@@ -204,9 +205,15 @@ public final class SubtitleDecoder: @unchecked Sendable {
                     lines.append(String(cString: text))
                 }
             default:
-                break // bitmap subtitle — deferred (libass/PGS pack)
+                break // bitmaps below
             }
         }
+        // Read after decoding: the bitmap decoders set the context's size to
+        // their authoring canvas as they parse it (DVB display definition,
+        // PGS presentation, DVD `size:`).
+        let images = SubtitleBitmap.images(
+            of: subtitle, canvasWidth: context.pointee.width, canvasHeight: context.pointee.height
+        )
         var text = lines.joined(separator: "\n")
         if isClosedCaptions {
             // Caption rows are indented by column position, which a text
@@ -227,7 +234,8 @@ public final class SubtitleDecoder: @unchecked Sendable {
             start: span.start,
             end: span.end,
             text: text.trimmingCharacters(in: .whitespacesAndNewlines),
-            replacesPrevious: replacesPrevious
+            replacesPrevious: replacesPrevious,
+            images: images
         ))
     }
 
@@ -245,6 +253,14 @@ public final class SubtitleDecoder: @unchecked Sendable {
             var pointer: UnsafeMutablePointer<AVCodecContext>? = context
             avcodec_free_context(&pointer)
             return false
+        }
+        if context.pointee.codec_id == AV_CODEC_ID_DVB_SUBTITLE {
+            // The DVB decoder takes its canvas from the first display
+            // definition only while the context has no size; the stream probe
+            // may have left one (often the 720×576 default), which would pin
+            // an HD page's bitmaps to an SD canvas.
+            context.pointee.width = 0
+            context.pointee.height = 0
         }
         context.pointee.pkt_timebase = lume_av_time_base_q()
         var options: OpaquePointer?

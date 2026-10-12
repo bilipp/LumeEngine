@@ -20,6 +20,8 @@
 #   hdr10.mp4      — HEVC Main 10, BT.2020 PQ, mastering display + content light level SEI, HDR10+ per frame
 #   surround51.ts  — 20 s H.264 + AC-3 5.1 MPEG-TS, tone in the centre channel only
 #   captions.ts    — H.264 TS with CEA-608 captions in A/53 SEI (1–3 s, 4–6 s; needs python3)
+#   pgs.mkv, dvbsub.ts, dvdsub.mkv — the same two bitmap subtitles (1–3 s, 4–6 s)
+#                    as PGS, DVB and DVD subtitles on a 1920x1080 canvas (needs python3)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -425,6 +427,79 @@ PY
         echo "generated: $OUT/captions.ts"
     else
         echo "skipped: $OUT/captions.ts (needs python3)" >&2
+    fi
+fi
+
+# Bitmap subtitles in the three formats broadcast and disc rips carry: PGS
+# (Blu-ray), DVB (European broadcast) and DVD. ffmpeg cannot render text into
+# subtitle bitmaps, but it converts between bitmap formats, so a short script
+# writes the PGS original by hand: a 64x16 bitmap (8 transparent, 24 opaque
+# white and 32 half-transparent red pixels per row) at (928, 1000) of a
+# 1920x1080 canvas shown 1–3 s, then a 48x8 white one at (936, 960) shown
+# 4–6 s, each ended by an empty presentation. A leading empty presentation at
+# 0 keeps ffmpeg from shifting the subtitles to start at 0, and
+# -fix_sub_duration turns PGS's "until the next one" into the durations the
+# DVB and DVD encoders need. The DVB conversion keeps the canvas as a display
+# definition segment.
+if [ ! -f "$OUT/pgs.mkv" ] || [ ! -f "$OUT/dvbsub.ts" ] || [ ! -f "$OUT/dvdsub.mkv" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I - "$OUT/bitmap-subs.sup" <<'PY'
+import struct
+import sys
+
+def segment(kind, pts, payload):
+    return b'PG' + struct.pack('>IIBH', pts, 0, kind, len(payload)) + payload
+
+def display_set(pts, composition, position=None, palette=None, bitmap=None):
+    objects = 1 if bitmap else 0
+    pcs = struct.pack('>HHBHBBBB', 1920, 1080, 0x10, composition, 0x80 if bitmap else 0x00, 0, 0, objects)
+    if bitmap:
+        x, y = position
+        width, height, rle = bitmap
+        pcs += struct.pack('>HBBHH', 0, 0, 0, x, y)
+        out = segment(0x16, pts, pcs)
+        out += segment(0x17, pts, struct.pack('>BBHHHH', 1, 0, x, y, width, height))
+        pds = struct.pack('>BB', 0, 0) + b''.join(struct.pack('>BBBBB', *entry) for entry in palette)
+        out += segment(0x14, pts, pds)
+        ods = struct.pack('>HBB', 0, 0, 0xC0) + struct.pack('>I', len(rle) + 4)[1:]
+        out += segment(0x15, pts, ods + struct.pack('>HH', width, height) + rle)
+    else:
+        out = segment(0x16, pts, pcs)
+        out += segment(0x17, pts, struct.pack('>BBHHHH', 1, 0, 0, 0, 1, 1))
+    return out + segment(0x80, pts, b'')
+
+# (index, Y, Cr, Cb, alpha): transparent, opaque white, half-transparent red.
+palette = [(0, 16, 128, 128, 0), (1, 235, 128, 128, 255), (2, 63, 240, 102, 128)]
+# PGS run-length lines: 00 0n = n of colour 0, 00 8n c = n of colour c, 00 00 = end.
+first = (64, 16, bytes([0, 0x08, 0, 0x80 | 24, 1, 0, 0x80 | 32, 2, 0, 0]) * 16)
+second = (48, 8, bytes([0, 0x80 | 48, 1, 0, 0]) * 8)
+
+stream = display_set(0, 0)
+stream += display_set(90_000 * 1, 1, (928, 1000), palette, first)
+stream += display_set(90_000 * 3, 2)
+stream += display_set(90_000 * 4, 3, (936, 960), palette, second)
+stream += display_set(90_000 * 6, 4)
+open(sys.argv[1], 'wb').write(stream)
+PY
+        "$FFMPEG" -hide_banner -loglevel error -y \
+            -f lavfi -i "testsrc2=duration=8:size=320x180:rate=25" \
+            -i "$OUT/bitmap-subs.sup" -map 0:v -map 1:s \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:s copy \
+            "$OUT/pgs.mkv"
+        "$FFMPEG" -hide_banner -loglevel error -y \
+            -f lavfi -i "testsrc2=duration=8:size=320x180:rate=25" \
+            -fix_sub_duration -i "$OUT/bitmap-subs.sup" -map 0:v -map 1:s \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:s dvbsub \
+            -muxdelay 0 -f mpegts "$OUT/dvbsub.ts"
+        "$FFMPEG" -hide_banner -loglevel error -y \
+            -f lavfi -i "testsrc2=duration=8:size=320x180:rate=25" \
+            -fix_sub_duration -i "$OUT/bitmap-subs.sup" -map 0:v -map 1:s \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:s dvdsub \
+            "$OUT/dvdsub.mkv"
+        rm -f "$OUT/bitmap-subs.sup"
+        echo "generated: $OUT/pgs.mkv $OUT/dvbsub.ts $OUT/dvdsub.mkv"
+    else
+        echo "skipped: bitmap subtitle fixtures (needs python3)" >&2
     fi
 fi
 

@@ -8,14 +8,19 @@ struct SubtitleEvent: Sendable, Equatable {
     /// exactly that — "until the next update" — and a decoder that turned it
     /// into a number would leave the text up for 49 days (`UINT32_MAX` ms).
     var end: Int64?
-    /// Display text, trimmed. Empty on a replacing track means "clear the
-    /// screen", which is how those formats end what is showing.
+    /// Display text, trimmed. Empty — with no images either — on a replacing
+    /// track means "clear the screen", which is how those formats end what is
+    /// showing.
     var text: String
     /// The track describes the whole screen with every update (closed
     /// captions, DVB, PGS, DVD): an update ends everything shown before it.
     /// Text formats (SRT, ASS, WebVTT, mov_text) overlap freely instead, each
     /// cue carrying its own end.
     var replacesPrevious: Bool
+    /// Bitmaps (DVB, PGS, DVD).
+    var images: [SubtitleImage] = []
+
+    var isEmpty: Bool { text.isEmpty && images.isEmpty }
 
     /// Where an `AVSubtitle` sits on the engine timeline. `base` is the
     /// subtitle's PTS in engine µs, display times are milliseconds after it.
@@ -66,8 +71,8 @@ struct SubtitleEvent: Sendable, Equatable {
 ///   seek, backfill seek) does not double its lines. On a replacing track a
 ///   different update at the same start replaces the stored one: the screen
 ///   at one instant has one state, and the latest decode of it wins.
-/// - At most `capacity` cues are kept; the ones farthest from where cues are
-///   being added go first.
+/// - At most `capacity` cues, holding at most `imageByteBudget` of bitmaps,
+///   are kept; the ones farthest from where cues are being added go first.
 struct SubtitleTimeline: Sendable {
     /// How long an open cue stays without a successor. Caption decoders on
     /// televisions erase a caption left standing by about this long without
@@ -80,6 +85,12 @@ struct SubtitleTimeline: Sendable {
     /// for a live track it is half an hour or more of roll-up captions.
     static let capacity = 8_192
 
+    /// Bitmap memory kept. A full-HD PGS line is the better part of a
+    /// megabyte decoded, so a cue count alone would let a film's bitmap track
+    /// grow to gigabytes; this keeps the last minute or more of a live DVB
+    /// page, and a backward seek re-decodes whatever was dropped.
+    static let imageByteBudget = 64 << 20
+
     /// How far back from an insertion point active cues are looked for.
     /// Overlap is rare and short-lived; a replacing track has at most one.
     private static let scanLimit = 64
@@ -89,15 +100,19 @@ struct SubtitleTimeline: Sendable {
         /// The end is the limit, not the source's: the next update or a seek
         /// may still bound it.
         var provisional: Bool
+
+        var imageBytes: Int { cue.images.reduce(0) { $0 + $1.byteCount } }
     }
 
     private var entries: [Entry] = []
     private var nextID: UInt64 = 0
+    /// Sum of `imageBytes` over `entries`.
+    private(set) var imageBytes = 0
 
     var count: Int { entries.count }
 
     mutating func apply(_ event: SubtitleEvent) {
-        if event.text.isEmpty {
+        if event.isEmpty {
             // A clear. Text tracks have no such thing; an empty text cue is
             // just nothing to show.
             guard event.replacesPrevious else { return }
@@ -119,13 +134,12 @@ struct SubtitleTimeline: Sendable {
         }
         guard end > event.start else { return }
 
-        entries.insert(
-            Entry(
-                cue: SubtitleCue(id: nextID, start: event.start, end: end, text: event.text),
-                provisional: event.end == nil
-            ),
-            at: index
+        let entry = Entry(
+            cue: SubtitleCue(id: nextID, start: event.start, end: end, text: event.text, images: event.images),
+            provisional: event.end == nil
         )
+        entries.insert(entry, at: index)
+        imageBytes += entry.imageBytes
         nextID += 1
         trim(keeping: index)
     }
@@ -140,6 +154,7 @@ struct SubtitleTimeline: Sendable {
 
     mutating func removeAll() {
         entries.removeAll()
+        imageBytes = 0
     }
 
     /// All cues covering `time` (engine µs), ordered by start.
@@ -175,7 +190,11 @@ struct SubtitleTimeline: Sendable {
         var index = insertionIndex(for: event.start) - 1
         while index >= 0 && entries[index].cue.start == event.start {
             let entry = entries[index]
-            if entry.cue.text == event.text {
+            // Bitmaps decoded twice are different objects; where and how big
+            // they are identifies them.
+            if entry.cue.text == event.text,
+               entry.cue.images.map(\.rect) == event.images.map(\.rect),
+               entry.cue.images.map(\.image.width) == event.images.map(\.image.width) {
                 // A stored end may have been bounded by a successor since, so
                 // it only has to match where both ends came from the source.
                 if event.replacesPrevious || event.end == nil || entry.provisional { return true }
@@ -189,7 +208,7 @@ struct SubtitleTimeline: Sendable {
     private mutating func removeEntries(startingAt start: Int64) {
         var index = insertionIndex(for: start) - 1
         while index >= 0 && entries[index].cue.start == start {
-            entries.remove(at: index)
+            imageBytes -= entries.remove(at: index).imageBytes
             index -= 1
         }
     }
@@ -201,26 +220,40 @@ struct SubtitleTimeline: Sendable {
         while index >= 0 && scanned < Self.scanLimit {
             let entry = entries[index]
             if entry.cue.start < time, entry.cue.end > time, !onlyProvisional || entry.provisional {
-                entries[index].cue = SubtitleCue(
-                    id: entry.cue.id, start: entry.cue.start, end: time, text: entry.cue.text
-                )
+                entries[index].cue = entry.cue.ending(at: time)
             }
             index -= 1
             scanned += 1
         }
     }
 
-    /// Drops cues beyond `capacity` from the end farther from `index`, where
-    /// cues are being added — the front on a live timeline, the back after a
-    /// seek far into the past of a long file. Drops an eighth more than
-    /// needed so the shift is not paid on every insert.
+    /// Drops cues beyond `capacity` or `imageByteBudget` from the end farther
+    /// from `index`, where cues are being added — the front on a live
+    /// timeline, the back after a seek far into the past of a long file. Over
+    /// capacity it drops an eighth more than needed, so the shift is not paid
+    /// on every insert. The cue just added always stays.
     private mutating func trim(keeping index: Int) {
-        guard entries.count > Self.capacity else { return }
-        let excess = entries.count - Self.capacity + Self.capacity / 8
-        if index < entries.count / 2 {
-            entries.removeLast(excess)
-        } else {
-            entries.removeFirst(excess)
+        var kept = index
+        if entries.count > Self.capacity {
+            drop(entries.count - Self.capacity + Self.capacity / 8, keeping: &kept)
         }
+        while imageBytes > Self.imageByteBudget, entries.count > 1 {
+            drop(1, keeping: &kept)
+        }
+    }
+
+    private mutating func drop(_ count: Int, keeping kept: inout Int) {
+        let count = min(count, entries.count - 1)
+        guard count > 0 else { return }
+        let removed: ArraySlice<Entry>
+        if kept < entries.count / 2 {
+            removed = entries[(entries.count - count)...]
+            entries.removeLast(count)
+        } else {
+            removed = entries[..<count]
+            entries.removeFirst(count)
+            kept -= count
+        }
+        imageBytes -= removed.reduce(0) { $0 + $1.imageBytes }
     }
 }

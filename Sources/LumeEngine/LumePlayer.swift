@@ -28,6 +28,10 @@ public final class LumePlayer {
     public private(set) var isHardwareDecoding = false
     /// Text of the currently visible subtitle cue(s), `nil` when none.
     public private(set) var subtitleText: String?
+    /// Bitmaps of the currently visible subtitle cue(s) — DVB, PGS and DVD
+    /// subtitles, which have no text. `LumePlayerView` does not draw them:
+    /// overlay each image at its `rect` scaled to the video's display area.
+    public private(set) var subtitleImages: [SubtitleImage] = []
 
     public var audioTracks: [TrackInfo] { mediaInfo?.audioTracks ?? [] }
     public var subtitleTracks: [TrackInfo] { mediaInfo?.subtitleTracks ?? [] }
@@ -146,7 +150,10 @@ public final class LumePlayer {
     public func selectSubtitleTrack(_ index: Int32?) {
         let session = session
         Task { await session?.selectSubtitleTrack(index) }
-        if index == nil { subtitleText = nil }
+        if index == nil {
+            subtitleText = nil
+            subtitleImages = []
+        }
     }
 
     public func loadExternalSubtitles(url: String) async throws {
@@ -165,6 +172,8 @@ public final class LumePlayer {
         position = 0
         mediaInfo = nil
         duration = nil
+        subtitleText = nil
+        subtitleImages = []
     }
 
     // MARK: Internals
@@ -210,10 +219,13 @@ public final class LumePlayer {
         let now = session.renderer.currentTime
         if MediaTime.isValid(now) {
             let cues = session.subtitles.activeCues(at: now)
-            let text = cues.map(\.text).joined(separator: "\n")
+            let text = cues.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
             subtitleText = text.isEmpty ? nil : text
+            let images = cues.flatMap(\.images)
+            if images != subtitleImages { subtitleImages = images }
         } else {
             subtitleText = nil
+            if !subtitleImages.isEmpty { subtitleImages = [] }
         }
     }
 
