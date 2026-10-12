@@ -6,6 +6,10 @@ import Foundation
 /// Picture-in-Picture for the custom renderer via the sample-buffer content
 /// source (PLAN.md §6). The display layer keeps receiving frames from the
 /// SystemRenderer while the system hosts it in the PiP window.
+///
+/// tvOS included: AVKit declares the sample-buffer content source and
+/// `invalidatePlaybackState` for tvOS 15+, so `isSupported` there is the
+/// device's own answer (`isPictureInPictureSupported()`), as on iOS.
 @MainActor
 public final class PictureInPictureBridge: NSObject {
     private var controller: AVPictureInPictureController?
@@ -14,6 +18,9 @@ public final class PictureInPictureBridge: NSObject {
     // Immutable snapshots for the synchronous nonisolated delegate callbacks.
     private let timelineStart: Int64
     private let timelineDuration: Int64?
+    /// Keeps the PiP window's play/pause button and timeline in step with the
+    /// clock; released with the bridge.
+    private var transportObservation: TransportObservation?
 
     public private(set) var isActive = false
 
@@ -38,6 +45,16 @@ public final class PictureInPictureBridge: NSObject {
         let controller = AVPictureInPictureController(contentSource: contentSource)
         controller.delegate = self
         self.controller = controller
+        // AVKit asks the playback delegate for its state only when told the
+        // state changed; without this the window keeps showing whatever it
+        // read when it opened — a pause button on a paused stream, a stale
+        // position after a seek. The clock's own transport changes are the
+        // trigger, which also catches what no session call does (the system
+        // zeroing the rate on an interruption). Low rate: these fire on
+        // play, pause, rate changes and seeks, never per frame.
+        transportObservation = renderer.observeTransport(on: .main) { [weak self] in
+            MainActor.assumeIsolated { self?.controller?.invalidatePlaybackState() }
+        }
     }
 
     public var isSupported: Bool { controller != nil }
