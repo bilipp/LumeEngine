@@ -57,7 +57,12 @@ enum SampleBufferBuilder {
     }
 
     /// Wraps a decoded video frame. `formatCache` avoids re-creating the format
-    /// description for every frame of the same stream configuration.
+    /// description for every frame of the same stream configuration. The
+    /// match is CoreMedia's own and covers every extension a description
+    /// shares with image buffers — colour tags, aspect ratio, and the HDR10
+    /// mastering display and light level — so a change in any of them, or
+    /// their disappearance, builds a new description rather than presenting
+    /// the frame under stale metadata.
     static func video(
         from frame: VideoFrame,
         formatCache: inout CMVideoFormatDescription?
@@ -91,7 +96,23 @@ enum SampleBufferBuilder {
         guard status == noErr, let sampleBuffer else {
             throw EngineError(code: .internalError, message: "video CMSampleBuffer failed (\(status))")
         }
+        if let message = frame.hdr10PlusMessage {
+            attachHDR10Plus(message, to: sampleBuffer)
+        }
         return sampleBuffer
+    }
+
+    /// HDR10+ is a per-sample attachment, not an image-buffer one, so it goes
+    /// into the sample's attachment dictionary. Best effort: a sample without
+    /// it still plays as static HDR10.
+    private static func attachHDR10Plus(_ message: Data, to sampleBuffer: CMSampleBuffer) {
+        // The array holds CFMutableDictionaries, toll-free bridged: setting a
+        // value on the bridged object sets it on the sample.
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true)
+                as? [NSMutableDictionary],
+              let sample = attachments.first
+        else { return }
+        sample[kCMSampleAttachmentKey_HDR10PlusPerFrameData] = message as CFData
     }
 
     /// Wraps a decoded audio frame (interleaved Float32) by copying its samples

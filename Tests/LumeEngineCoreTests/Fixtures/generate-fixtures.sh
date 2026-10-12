@@ -17,6 +17,7 @@
 #   hls-live/      — 12 s as six 2 s HLS segments + playlist (served live by the tests)
 #   replay.ts      — 8 s TS whose bytes jump back ~3 s at ~6 s, as a reconnect replays them
 #   ac4.ts         — TS whose first audio (ger) is declared AC-4, which no decoder here plays, then eng AAC
+#   hdr10.mp4      — HEVC Main 10, BT.2020 PQ, mastering display + content light level SEI, HDR10+ per frame
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -297,6 +298,35 @@ open(sys.argv[2], "wb").write(data)
 PATCH
     rm -f "$OUT/ac4-source.ts"
     echo "generated: $OUT/ac4.ts"
+fi
+
+# HDR10 the way a streaming encode ships it: HEVC Main 10 tagged BT.2020 PQ,
+# with the mastering display (a P3-D65 grading monitor, 1000 cd/m² peak) and
+# content light level SEI on every keyframe, plus HDR10+ dynamic metadata
+# (one scene, which x265 repeats on every frame). libx265 ships with
+# Homebrew's ffmpeg.
+if [ ! -f "$OUT/hdr10.mp4" ]; then
+    cat > "$OUT/hdr10plus.json" <<'JSON'
+{"JSONInfo": {"HDR10plusProfile": "B", "Version": "1.0"},
+ "SceneInfo": [{
+   "SceneFrameIndex": 0, "SceneId": 0, "SequenceFrameIndex": 0,
+   "NumberOfWindows": 1, "TargetedSystemDisplayMaximumLuminance": 400,
+   "LuminanceParameters": {
+     "AverageRGB": 1000, "MaxScl": [5000, 6000, 7000],
+     "LuminanceDistributions": {
+       "DistributionIndex": [1, 5, 10, 25, 50, 75, 90, 95, 99],
+       "DistributionValues": [0, 100, 200, 300, 400, 500, 600, 700, 800]}},
+   "BezierCurveData": {"KneePointX": 0, "KneePointY": 0,
+     "Anchors": [256, 512, 768, 1023, 1023, 1023, 1023, 1023, 1023]}}]}
+JSON
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=2:size=320x180:rate=25" \
+        -c:v libx265 -preset ultrafast -pix_fmt yuv420p10le -tag:v hvc1 \
+        -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+        -x265-params "log-level=error:keyint=25:hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400:dhdr10-info=$OUT/hdr10plus.json" \
+        "$OUT/hdr10.mp4"
+    rm -f "$OUT/hdr10plus.json"
+    echo "generated: $OUT/hdr10.mp4"
 fi
 
 echo "fixtures ready in $OUT"
