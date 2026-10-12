@@ -101,12 +101,13 @@ public struct DolbyVisionConfiguration: Sendable, Equatable {
         self.metadataCompression = metadataCompression
     }
 
-    /// The base layer is IPTPQc2 rather than a displayable fallback (HDR10,
-    /// SDR, HLG): profiles 5, 10.0 and 20. The engine converts these to HDR10
-    /// (`DolbyVisionConverter`). Profile 4 also reports ID 0, but its base
-    /// layer is SDR plus an enhancement layer this engine does not decode.
+    /// The record claims an IPTPQc2 base layer rather than a displayable
+    /// fallback (HDR10, SDR, HLG): profiles 5, 10.0 and 20. Records lie
+    /// (remuxes label HDR10 as profile 5), so the engine decides per frame
+    /// whether to convert to HDR10 (`DolbyVisionDetection`); this is the
+    /// stream-level claim.
     public var baseLayerIsIPT: Bool {
-        baseLayerCompatibilityID == 0 && [5, 10, 20].contains(profile)
+        DolbyVisionDetection.Record(self).claimsIPT
     }
 }
 
