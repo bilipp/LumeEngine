@@ -70,6 +70,11 @@ public struct PlayerConfiguration: Sendable {
     public var autoEnableForcedSubtitlesForForeignAudio = false
     /// Seconds without clock progress (while expected) before `.stalled` fires.
     public var stallThreshold: Double = 8
+    /// The output route the audio is fitted to. nil follows the shared audio
+    /// session through route changes (iOS/tvOS/visionOS; stereo on macOS).
+    /// Pass one to pin the width or drive it yourself, e.g. for a macOS
+    /// multichannel interface.
+    public var audioOutputRoute: AudioOutputRoute?
 
     public init() {}
 }
@@ -167,9 +172,20 @@ public actor PlayerSession {
     public private(set) var selectedSubtitleTrackIndex: Int32?
     public private(set) var usingExternalSubtitles = false
 
+    /// Width the audio lane is fitted to; shared with its decoder and the renderer.
+    private let audioRoute: AudioOutputRoute
+    private var audioLoss = AudioLossDetector()
+
+    /// Whether audio is reaching the viewer (see `AudioHealth`).
+    public var audioHealth: AudioHealth { audioLoss.health }
+
+    /// The layout the audio lane hands the renderer; nil without audio.
+    public var audioOutput: AudioOutputLayout? { audioDecoder?.currentOutput }
+
     public init(configuration: PlayerConfiguration = PlayerConfiguration()) {
         self.configuration = configuration
-        renderer = SystemRenderer(muted: configuration.muted)
+        audioRoute = configuration.audioOutputRoute ?? AudioOutputRoute.system()
+        renderer = SystemRenderer(muted: configuration.muted, audioOutputRoute: audioRoute)
         var continuation: AsyncStream<PlayerEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
@@ -271,7 +287,7 @@ public actor PlayerSession {
             let packets = makeAudioPacketChannel()
             let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
             demuxer.attach(channel: packets, toStream: track.index)
-            let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
+            let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames, route: audioRoute)
             audioPackets = packets
             audioFrames = frames
             audioDecoder = decoder
@@ -428,6 +444,12 @@ public actor PlayerSession {
         public let lastStallReason: StallReason?
         /// The display mode the video wants (see `displayCriteria`).
         public let displayCriteria: ContentDisplayCriteria?
+        /// Whether audio is reaching the viewer.
+        public let audioHealth: AudioHealth
+        /// Source → output channels of the audio lane; nil without one.
+        public let audioOutput: AudioOutputLayout?
+        /// The output route the audio is fitted to.
+        public let audioRoute: AudioOutputRoute.Snapshot
 
         public var description: String {
             func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
@@ -454,6 +476,8 @@ public actor PlayerSession {
             )
             if let lastStallReason { line += " stall=\(lastStallReason.rawValue)" }
             if let displayCriteria { line += " display=\(displayCriteria)" }
+            line += " aout=\(audioOutput.map(String.init(describing:)) ?? "off") route=\(audioRoute)"
+            if case .lost = audioHealth { line += " audio=\(audioHealth)" }
             line += " startup=[\(startup)]"
             return line
         }
@@ -490,7 +514,10 @@ public actor PlayerSession {
             replayedPackets: demuxer?.replayedPackets ?? 0,
             startup: startup,
             lastStallReason: lastStallReason,
-            displayCriteria: displayCriteria
+            displayCriteria: displayCriteria,
+            audioHealth: audioHealth,
+            audioOutput: audioOutput,
+            audioRoute: audioRoute.snapshot
         )
     }
 
@@ -665,6 +692,7 @@ public actor PlayerSession {
         audioFrames = nil
         selectedAudioTrackIndex = nil
         audioAtEOF = false
+        audioLoss.laneReplaced()
         renderer.attach(video: videoFrames, audio: nil)
     }
 
@@ -678,11 +706,12 @@ public actor PlayerSession {
         let packets = makeAudioPacketChannel()
         let frames = Channel<AudioFrame>(capacity: configuration.audioQueueDepth, measure: { $0.duration })
         demuxer.attach(channel: packets, toStream: trackIndex)
-        let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames)
+        let decoder = AudioDecoder(parameters: parameters, input: packets, output: frames, route: audioRoute)
         audioPackets = packets
         audioFrames = frames
         audioDecoder = decoder
         audioAtEOF = false
+        audioLoss.laneReplaced()
         selectedAudioTrackIndex = trackIndex
         let pump = Task { [events = decoder.events] in
             for await event in events {
@@ -840,7 +869,12 @@ public actor PlayerSession {
             // One lane dying is not necessarily fatal (e.g. broken audio track,
             // healthy video) — surface it; the monitor decides on full failure.
             eventSink.yield(.error(error))
-            if isVideo { videoAtEOF = true } else { audioAtEOF = true }
+            if isVideo {
+                videoAtEOF = true
+            } else {
+                audioAtEOF = true
+                audioLoss.decoderFailed()
+            }
             lastError = error
         }
     }
@@ -855,7 +889,34 @@ public actor PlayerSession {
             evaluatePlayback()
             runStallWatchdog()
             noteFirstFrameShown()
+            evaluateAudioHealth()
         }
+    }
+
+    /// Audio that stops while the picture plays on is a failure the viewer
+    /// notices and nothing else would report (see `AudioLossDetector` for
+    /// what does not count).
+    private func evaluateAudioHealth() {
+        let playhead = renderer.currentTime
+        let highWater = renderer.enqueuedHighWaterMark
+        func ahead(_ mark: Int64) -> Bool {
+            MediaTime.isValid(mark) && MediaTime.isValid(playhead) && mark > playhead
+        }
+        let observation = AudioLossDetector.Observation(
+            hasAudioLane: audioDecoder != nil,
+            audioEnded: audioAtEOF,
+            audioRendererFailed: renderer.audioRendererFailed,
+            clockRunning: state == .playing && renderer.rate > 0,
+            playhead: MediaTime.isValid(playhead) ? MediaTime.seconds(playhead) : nil,
+            audioAhead: ahead(highWater.audio),
+            videoAhead: videoDecoder != nil ? ahead(highWater.video) : nil,
+            serial: currentSerial
+        )
+        guard audioLoss.observe(observation) == .starved else { return }
+        eventSink.yield(.error(EngineError(
+            code: .audioLost,
+            message: "audio stopped reaching the renderer while video plays"
+        )))
     }
 
     /// A container seek can "succeed" while landing somewhere else entirely —

@@ -333,7 +333,8 @@ struct DecoderTests {
         let collected = await collector.value
         let rate = try #require(collected.rates.first)
         #expect(collected.rates.count == 1)
-        #expect(collected.channels == [1], "sine fixture is mono")
+        // The sine fixture is mono; on a stereo route it goes out on both sides.
+        #expect(collected.channels == [2], "mono source on a stereo route")
         let seconds = Double(collected.totalSamples) / Double(rate)
         #expect(abs(seconds - 10.0) < 0.3, "expected ~10 s of audio, got \(seconds)")
         let ptsValues = collected.ptsValues

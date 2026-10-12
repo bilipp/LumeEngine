@@ -25,6 +25,13 @@ public struct EngineError: Error, Sendable, CustomStringConvertible, Equatable {
         /// ends arrives as `.ioError` instead: FFmpeg cannot tell it from a
         /// dropped connection.)
         case sourceEnded
+        /// Audio stopped reaching the renderer while video plays on. Not
+        /// fatal: the session keeps playing, without sound, and recovers by
+        /// itself if audio comes back. `PlayerSession.audioHealth` says which
+        /// stage lost it. (An audio decoder that gives up reports its own
+        /// `.decodeFailed` instead, and a failed audio renderer fails the
+        /// session with `.renderFailed`.)
+        case audioLost
     }
 
     /// The HTTP status class a source answered with, when FFmpeg reported one.
