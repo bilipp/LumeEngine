@@ -10,6 +10,7 @@ public enum PlayerEvent: Sendable {
     /// `stallThreshold` seconds (dead source, starved network, silent decoder
     /// death upstream). The engine kicks seekable sources once; live sources
     /// are the app's cue to reconnect (Lume: PlaybackRetryController).
+    /// `PlayerSession.lastStallReason` says which stage stopped.
     case stalled(position: Double)
     case error(EngineError)
 }
@@ -128,6 +129,9 @@ public actor PlayerSession {
     private var videoAtEOF = false
     private var audioAtEOF = false
     private var lastError: EngineError?
+    /// The source failed after media had arrived: the buffered media plays
+    /// out, then the session fails with this error (see `handleSourceLoss`).
+    private var sourceFailure: EngineError?
     private var pendingSeekTarget: Int64?
     /// Set when a seek completed and the landing position still needs to be
     /// verified against the first actually-delivered frames.
@@ -138,6 +142,17 @@ public actor PlayerSession {
     private var lastObservedProgress: Double = -1
     private var lastProgressDate = Date.distantFuture
     private var lastStallKick: Date?
+    /// Playhead when progress was last observed: tells a clock that stood
+    /// still from one that ran dry (see `StallReason.diagnose`).
+    private var clockAtLastProgress: Double = 0
+
+    /// The stage that stopped at the most recent `.stalled`; nil before any.
+    public private(set) var lastStallReason: StallReason?
+
+    // Startup timeline, `systemUptime` stamps (see `startup`).
+    private var openStartedAt: TimeInterval?
+    private var openedAt: TimeInterval?
+    private var firstFrameShownAt: TimeInterval?
 
     // Track lanes (see PlayerSession+Tracks.swift).
     private var subtitleDecoder: SubtitleDecoder?
@@ -164,6 +179,7 @@ public actor PlayerSession {
             throw EngineError(code: .invalidState, message: "PlayerSession.open called twice — create a new session")
         }
         state = .opening
+        openStartedAt = ProcessInfo.processInfo.systemUptime
 
         let demuxer = Demuxer(url: url, options: configuration.demuxer)
         self.demuxer = demuxer
@@ -362,6 +378,20 @@ public actor PlayerSession {
 
     public var mediaInfo: MediaInfo? { info }
 
+    /// How far startup has got and how long each step took.
+    public var startup: StartupTimeline {
+        var timeline = StartupTimeline()
+        guard let start = openStartedAt else { return timeline }
+        func since(_ stamp: TimeInterval?) -> Double? { stamp.map { max(0, $0 - start) } }
+        timeline.opened = since(openedAt)
+        timeline.firstPacket = since(demuxer?.firstPacketUptime)
+        let enqueued = renderer.firstEnqueueUptime
+        timeline.firstVideoFrame = since(enqueued.video)
+        timeline.firstAudioFrame = since(enqueued.audio)
+        timeline.firstFrameShown = since(firstFrameShownAt)
+        return timeline
+    }
+
     /// One-line pipeline health snapshot for app-side diagnostics/logging:
     /// where the playhead is, how full each stage is, and whether the
     /// renderers are still healthy. Cheap to compute; poll at a low rate.
@@ -381,12 +411,18 @@ public actor PlayerSession {
         public let audioFirstSeconds: Double
         public let rendererHealth: (videoStatus: Int, audioStatus: Int, videoError: String?, audioError: String?)
         public let demuxAtEOF: Bool
+        /// The source failed and the session is playing out what it buffered.
+        public let sourceLost: Bool
         /// Total compressed bytes demuxed — diff across heartbeats for the
         /// effective delivery rate.
         public let deliveredBytes: Int64
         /// Timestamp discontinuities folded out of the timeline (encoder
         /// restarts, chunk seams) since open.
         public let timelineSeams: Int
+        /// Packets a reconnected source sent again and the demuxer dropped.
+        public let replayedPackets: Int
+        public let startup: StartupTimeline
+        public let lastStallReason: StallReason?
 
         public var description: String {
             func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
@@ -400,17 +436,20 @@ public actor PlayerSession {
             var health = "v\(rendererHealth.videoStatus) a\(rendererHealth.audioStatus)"
             if let error = rendererHealth.videoError { health += " vErr(\(error))" }
             if let error = rendererHealth.audioError { health += " aErr(\(error))" }
-            return String(
-                format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB seams=%ld",
+            var line = String(
+                format: "state=%@ playhead=%.2fs vq=%@ vp=%@ aq=%@ ap=%@ renderers=%@ demuxEOF=%@ read=%.1fMB seams=%ld dup=%ld",
                 state, playheadSeconds,
                 lane(videoQueue, lead: videoLeadSeconds, first: videoFirstSeconds),
                 packets(videoPacketQueue),
                 lane(audioQueue, lead: audioLeadSeconds, first: audioFirstSeconds),
                 packets(audioPacketQueue),
-                health, demuxAtEOF ? "yes" : "no",
+                health, sourceLost ? "lost" : demuxAtEOF ? "yes" : "no",
                 Double(deliveredBytes) / 1_048_576,
-                timelineSeams
+                timelineSeams, replayedPackets
             )
+            if let lastStallReason { line += " stall=\(lastStallReason.rawValue)" }
+            line += " startup=[\(startup)]"
+            return line
         }
     }
 
@@ -439,8 +478,12 @@ public actor PlayerSession {
             audioFirstSeconds: MediaTime.isValid(lowWater.audio) ? MediaTime.seconds(lowWater.audio) : -1,
             rendererHealth: renderer.rendererHealth,
             demuxAtEOF: demuxAtEOF,
+            sourceLost: sourceFailure != nil,
             deliveredBytes: demuxer?.deliveredBytes ?? 0,
-            timelineSeams: demuxer?.timelineSeams ?? 0
+            timelineSeams: demuxer?.timelineSeams ?? 0,
+            replayedPackets: demuxer?.replayedPackets ?? 0,
+            startup: startup,
+            lastStallReason: lastStallReason
         )
     }
 
@@ -601,6 +644,7 @@ public actor PlayerSession {
     private func handleDemux(_ event: DemuxEvent) {
         switch event {
         case .opened(let info):
+            openedAt = ProcessInfo.processInfo.systemUptime
             openContinuation?.resume(returning: info)
             openContinuation = nil
 
@@ -609,6 +653,8 @@ public actor PlayerSession {
             openContinuation = nil
 
         case .didSeek(_, let serial):
+            // The source answered a seek: whatever failed before is behind it.
+            sourceFailure = nil
             currentSerial = serial
             renderer.flush(acceptingSerial: serial)
             if let target = pendingSeekTarget {
@@ -650,11 +696,31 @@ public actor PlayerSession {
             break // transient; the demuxer keeps reading
 
         case .failed(let error):
-            failSession(error)
+            handleSourceLoss(error)
 
         case .closed:
             break
         }
+    }
+
+    /// The demuxer gave up on the source. Fail at once when there is nothing
+    /// to show; otherwise treat it as the end of the input, so the decoders
+    /// drain and what arrived plays out (up to `packetReadAhead` of it), and
+    /// fail once it has. A live channel that drops holds seconds of media the
+    /// viewer would otherwise lose, and an app that reconnects gets those
+    /// seconds to do it in. Reported only at the end, as one failure, so a
+    /// session that fails always fails exactly once.
+    private func handleSourceLoss(_ error: EngineError) {
+        guard state != .failed, state != .idle else { return }
+        guard pipelineSeconds >= 0.5 else {
+            failSession(error)
+            return
+        }
+        sourceFailure = error
+        demuxAtEOF = true
+        videoDecoder?.signalEndOfStream()
+        audioDecoder?.signalEndOfStream()
+        evaluatePlayback()
     }
 
     /// A renderer went `.failed` (it permanently stops accepting data — the
@@ -699,6 +765,7 @@ public actor PlayerSession {
             verifySeekLanding()
             evaluatePlayback()
             runStallWatchdog()
+            noteFirstFrameShown()
         }
     }
 
@@ -735,6 +802,16 @@ public actor PlayerSession {
         eventSink.yield(.didSeek(position: MediaTime.seconds(landed - (info?.startTime ?? 0))))
     }
 
+    /// Startup's last step: the clock runs and has reached the first frame.
+    private func noteFirstFrameShown() {
+        guard firstFrameShownAt == nil, state == .playing, renderer.rate > 0 else { return }
+        let first = renderer.enqueuedLowWaterMark
+        let mark = videoDecoder != nil ? first.video : first.audio
+        let now = renderer.currentTime
+        guard MediaTime.isValid(mark), MediaTime.isValid(now), now >= mark else { return }
+        firstFrameShownAt = ProcessInfo.processInfo.systemUptime
+    }
+
     /// Ground truth is progress, not any state flag: the signal is the
     /// least-advanced lane's enqueued high-water mark plus the remaining
     /// pipeline runway. It grows in every healthy mode — enqueues advance
@@ -768,10 +845,12 @@ public actor PlayerSession {
         if progress > lastObservedProgress + 0.01 {
             lastObservedProgress = progress
             lastProgressDate = Date()
+            clockAtLastProgress = current
             return
         }
         if lastProgressDate == .distantFuture {
             lastProgressDate = Date()
+            clockAtLastProgress = current
             return
         }
 
@@ -783,6 +862,7 @@ public actor PlayerSession {
             return
         }
         lastStallKick = Date()
+        lastStallReason = diagnoseStall(position: current)
         eventSink.yield(.stalled(position: current))
 
         // Self-heal once for seekable sources: re-enter through the ordinary
@@ -791,6 +871,39 @@ public actor PlayerSession {
             seek(to: current)
         }
         lastProgressDate = Date()
+        clockAtLastProgress = current
+    }
+
+    private func diagnoseStall(position current: Double) -> StallReason {
+        let playhead = renderer.currentTime
+        let highWater = renderer.enqueuedHighWaterMark
+        func lead(_ mark: Int64) -> Double {
+            guard MediaTime.isValid(mark), MediaTime.isValid(playhead), mark > playhead else { return 0 }
+            return MediaTime.seconds(mark - playhead)
+        }
+        func seconds(_ channel: Channel<some Sendable>?) -> Double {
+            MediaTime.seconds(channel?.stats.bufferedDuration ?? 0)
+        }
+        var lanes: [StallReason.Lane] = []
+        if videoDecoder != nil, !videoAtEOF {
+            lanes.append(StallReason.Lane(
+                isVideo: true,
+                decoded: seconds(videoFrames) + lead(highWater.video),
+                packets: seconds(videoPackets)
+            ))
+        }
+        if audioDecoder != nil, !audioAtEOF {
+            lanes.append(StallReason.Lane(
+                isVideo: false,
+                decoded: seconds(audioFrames) + lead(highWater.audio),
+                packets: seconds(audioPackets)
+            ))
+        }
+        return StallReason.diagnose(
+            clockShouldRun: renderer.rate > 0,
+            clockMoved: abs(current - clockAtLastProgress),
+            lanes: lanes
+        )
     }
 
     /// Buffer state is *derived* from actual queue depth and clock positions —
@@ -813,6 +926,12 @@ public actor PlayerSession {
             let highWater = renderer.enqueuedHighWaterMark
             let mark = max(highWater.video, highWater.audio)
             if !MediaTime.isValid(mark) || renderer.currentTime >= mark {
+                if let sourceFailure {
+                    // The source failed earlier and what it delivered has
+                    // now played (see `handleSourceLoss`).
+                    failSession(sourceFailure)
+                    return
+                }
                 if info?.isLive == true {
                     // A live source has no end: reaching one means the source
                     // was lost. What was buffered has played out by now, so

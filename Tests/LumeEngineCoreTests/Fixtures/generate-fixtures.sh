@@ -15,6 +15,7 @@
 #   catchup.ts     — two TS chunks concatenated, each restarting its timestamps
 #   anamorphic.ts  — 720x576i PAL SD, pixel aspect 64:45 (a 16:9 picture), untagged colour
 #   hls-live/      — 12 s as six 2 s HLS segments + playlist (served live by the tests)
+#   replay.ts      — 8 s TS whose bytes jump back ~3 s at ~6 s, as a reconnect replays them
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -209,6 +210,26 @@ if [ ! -f "$OUT/hls-live/index.m3u8" ]; then
         -hls_segment_filename "$OUT/hls-live/seg%d.ts" \
         "$OUT/hls-live/index.m3u8"
     echo "generated: $OUT/hls-live/index.m3u8"
+fi
+
+# What a live channel's byte stream looks like across a reconnect: the server
+# answers the new request with seconds the client already received. Cut at
+# three quarters of the file and continue from three eighths (on 188-byte TS
+# packet boundaries), so about 3 s arrive twice.
+if [ ! -f "$OUT/replay.ts" ]; then
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=8:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=8" \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+        -c:a aac -shortest -muxdelay 0 -output_ts_offset 600 -f mpegts \
+        "$OUT/replay-source.ts"
+    packets=$(( $(wc -c < "$OUT/replay-source.ts") / 188 ))
+    {
+        dd if="$OUT/replay-source.ts" bs=188 count=$(( packets * 3 / 4 )) 2>/dev/null
+        dd if="$OUT/replay-source.ts" bs=188 skip=$(( packets * 3 / 8 )) 2>/dev/null
+    } > "$OUT/replay.ts"
+    rm -f "$OUT/replay-source.ts"
+    echo "generated: $OUT/replay.ts"
 fi
 
 echo "fixtures ready in $OUT"

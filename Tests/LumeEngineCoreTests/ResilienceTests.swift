@@ -205,24 +205,67 @@ struct ResilienceTests {
         await session.shutdown()
     }
 
-    @Test("a length-less live HTTP body that ends fails the session", .timeLimit(.minutes(1)))
+    @Test("a live HTTP body that ends plays out what arrived, then fails", .timeLimit(.minutes(1)))
     func liveHTTPBodyEnded() async throws {
         // FFmpeg reports the end of a body of unknown length as an I/O error,
-        // so this reaches the session as a demuxer failure. Pinned here so a
-        // change in that behaviour cannot quietly turn live ends into .ended.
+        // so this reaches the session as a demuxer failure. The whole 12 s
+        // arrive in well under a second: the session must play them out
+        // before it fails, and fail once, with the source's error.
         let server = try TortureHTTPServer(mode: .unbounded(file: Fixtures.url("wrap.ts")))
         defer { server.stop() }
 
         let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 30))
+        let errors = LockedBox<[EngineError]>([])
+        let eventTask = Task {
+            for await event in session.events {
+                if case .error(let error) = event { errors.set(errors.get() + [error]) }
+            }
+        }
+        defer { eventTask.cancel() }
+
         let info = try await session.open(url: server.url)
         #expect(info.isLive)
         await session.play()
+        let lost = await eventually(timeout: 10) { await session.diagnostics.sourceLost }
+        #expect(lost, "the session must notice the source is gone")
+        let lostAt = Date()
         let settled = await eventually(timeout: 30) {
             let state = await session.state
             return state == .failed || state == .ended
         }
         #expect(settled)
         #expect(await session.state == .failed)
+        let playedOut = Date().timeIntervalSince(lostAt)
+        #expect(playedOut > 6, "the buffered seconds must play before the failure, failed after \(playedOut) s")
+        // State changes before the event reaches the task; give it a moment.
+        _ = await eventually(timeout: 2) { !errors.get().isEmpty }
+        try? await Task.sleep(for: .milliseconds(300))
+        let reported = errors.get()
+        #expect(reported.map(\.code) == [.ioError], "one failure, the source's: \(reported)")
+        await session.shutdown()
+    }
+
+    @Test("a live channel that reconnects plays the replayed seconds once", .timeLimit(.minutes(1)))
+    func reconnectReplay() async throws {
+        // The connection breaks at ~6 s; FFmpeg reconnects and the server
+        // answers from ~3 s, as one answering from its buffer does.
+        let file = try Fixtures.url("wrap.ts")
+        let size = try #require(try FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int)
+        let server = try TortureHTTPServer(mode: .reconnectReplay(file: file, dropAt: size / 2, resumeAt: size / 4))
+        defer { server.stop() }
+
+        var configuration = makeConfiguration(stallThreshold: 30)
+        configuration.demuxer.enableReconnect = true
+        let session = PlayerSession(configuration: configuration)
+        _ = try await session.open(url: server.url)
+        await session.play()
+
+        let finished = await eventually(timeout: 40) { await session.state == .failed }
+        #expect(finished, "the source ends after the replay, so the session fails once it played out")
+        #expect(server.connectionCount == 2, "FFmpeg must have reconnected once")
+        let diagnostics = await session.diagnostics
+        #expect(diagnostics.replayedPackets > 100, "~3 s of the source arrive twice: \(diagnostics)")
+        #expect(diagnostics.timelineSeams == 0, "a replay is not a seam: \(diagnostics)")
         await session.shutdown()
     }
 
@@ -274,6 +317,7 @@ struct ResilienceTests {
 
         let stalled = await eventually(timeout: 30) { stalledFlag.get() }
         #expect(stalled, "watchdog must report a stall — silence is not an acceptable failure mode")
+        #expect(await session.lastStallReason == .source, "nothing arrives: the source stalled")
 
         // Teardown while the demuxer is blocked in network I/O must still be bounded.
         let teardownStart = Date()

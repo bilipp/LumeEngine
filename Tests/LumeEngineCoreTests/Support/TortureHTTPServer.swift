@@ -17,6 +17,12 @@ final class TortureHTTPServer: @unchecked Sendable {
         /// lost connection (a body of unknown length always ends
         /// "prematurely") and reports an I/O error.
         case unbounded(file: URL)
+        /// A live channel that drops and is reconnected: chunked like
+        /// `.unbounded`, the first connection breaks off after the bytes up
+        /// to `dropAt`, and every later one starts again at `resumeAt` —
+        /// earlier, the way a server answers a reconnect from its buffer — and
+        /// runs to the end. Both offsets are rounded down to 188-byte TS packets.
+        case reconnectReplay(file: URL, dropAt: Int, resumeAt: Int)
         /// Serve an HLS directory (`index.m3u8` + segments) as a live channel
         /// that ends: the first playlist request gets the playlist without its
         /// `#EXT-X-ENDLIST`, every later one with it. Use `hlsURL`.
@@ -91,6 +97,15 @@ final class TortureHTTPServer: @unchecked Sendable {
 
     /// Playlist requests served so far (HLS mode). Guarded by `lock`.
     private var playlistRequests = 0
+    /// Connections accepted so far. Guarded by `lock`.
+    private var accepted = 0
+
+    /// Connections accepted so far: more than one means the client reconnected.
+    var connectionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return accepted
+    }
 
     func stop() {
         listener.cancel()
@@ -104,11 +119,15 @@ final class TortureHTTPServer: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         lock.lock()
         connections.append(connection)
+        accepted += 1
         lock.unlock()
 
         connection.start(queue: queue)
+        lock.lock()
+        let index = accepted
+        lock.unlock()
         readRequest(connection, received: Data()) { [weak self] path in
-            self?.respond(on: connection, path: path)
+            self?.respond(on: connection, path: path, connectionIndex: index)
         }
     }
 
@@ -127,7 +146,8 @@ final class TortureHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func respond(on connection: NWConnection, path: String) {
+    /// `connectionIndex`: 1 for the first connection accepted, and so on.
+    private func respond(on connection: NWConnection, path: String, connectionIndex: Int) {
         switch mode {
         case .forbidden:
             reject(connection, status: 403)
@@ -137,17 +157,23 @@ final class TortureHTTPServer: @unchecked Sendable {
 
         case .unbounded(let url):
             guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
-            var body = Data("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".utf8)
-            var offset = 0
-            while offset < payload.count {
-                let chunk = payload[offset..<min(offset + 64 * 1024, payload.count)]
-                body += Data("\(String(chunk.count, radix: 16))\r\n".utf8) + chunk + Data("\r\n".utf8)
-                offset += chunk.count
-            }
-            body += Data("0\r\n\r\n".utf8)
-            connection.send(content: body, completion: .contentProcessed { _ in
+            connection.send(content: chunked(payload, terminated: true), completion: .contentProcessed { _ in
                 connection.cancel()
             })
+
+        case .reconnectReplay(let url, let dropAt, let resumeAt):
+            guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
+            if connectionIndex == 1 {
+                let end = min(dropAt / 188 * 188, payload.count)
+                connection.send(content: chunked(payload.prefix(end), terminated: false), completion: .contentProcessed { _ in
+                    connection.forceCancel()
+                })
+            } else {
+                let start = min(resumeAt / 188 * 188, payload.count)
+                connection.send(content: chunked(payload.suffix(from: start), terminated: true), completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+            }
 
         case .file(let url):
             guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
@@ -239,6 +265,20 @@ final class TortureHTTPServer: @unchecked Sendable {
                 self.sendPaced(payload: payload, offset: end, chunk: chunk, interval: interval, start: start, index: next, on: connection)
             }
         })
+    }
+
+    /// A 200 response head plus `payload` in chunked transfer encoding;
+    /// `terminated` adds the final zero-length chunk (the body ended cleanly).
+    private func chunked(_ payload: Data, terminated: Bool) -> Data {
+        var body = Data("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".utf8)
+        var offset = payload.startIndex
+        while offset < payload.endIndex {
+            let chunk = payload[offset..<min(offset + 64 * 1024, payload.endIndex)]
+            body += Data("\(String(chunk.count, radix: 16))\r\n".utf8) + chunk + Data("\r\n".utf8)
+            offset += chunk.count
+        }
+        if terminated { body += Data("0\r\n\r\n".utf8) }
+        return body
     }
 
     private func reject(_ connection: NWConnection, status: Int) {

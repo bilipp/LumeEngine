@@ -56,6 +56,34 @@ struct PlayerSessionTests {
         await session.shutdown()
     }
 
+    @Test("startup records each step once, in order", .timeLimit(.minutes(1)))
+    func startupTimeline() async throws {
+        let session = makeSession()
+        #expect(await session.startup == StartupTimeline())
+        _ = try await session.open(url: try Fixtures.path("basic.mp4"))
+        let opened = await session.startup
+        #expect(opened.opened != nil)
+        #expect(opened.firstFrameShown == nil, "nothing is shown before play()")
+
+        await session.play()
+        let shown = await eventually { await session.startup.firstFrameShown != nil }
+        #expect(shown, "the first frame must be recorded once the clock reaches it")
+
+        let startup = await session.startup
+        let steps = [startup.opened, startup.firstPacket, startup.firstVideoFrame, startup.firstFrameShown]
+        let times = steps.compactMap(\.self)
+        #expect(times.count == steps.count, "every step must be reached: \(startup)")
+        #expect(zip(times, times.dropFirst()).allSatisfy { $0 <= $1 }, "steps happen in order: \(startup)")
+        #expect(startup.firstAudioFrame != nil)
+        #expect(await session.diagnostics.description.contains("startup=[open "))
+
+        // A seek flushes the renderers but is not a second startup.
+        await session.seek(to: 5)
+        _ = await eventually { await session.position > 5.2 }
+        #expect(await session.startup == startup)
+        await session.shutdown()
+    }
+
     @Test("pause freezes the clock; play resumes", .timeLimit(.minutes(1)))
     func pauseResume() async throws {
         let session = makeSession()
