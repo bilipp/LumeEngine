@@ -96,7 +96,7 @@ public actor PlayerSession {
     public nonisolated let events: AsyncStream<PlayerEvent>
     private let eventSink: AsyncStream<PlayerEvent>.Continuation
 
-    private let configuration: PlayerConfiguration
+    let configuration: PlayerConfiguration
     /// The presentation backend; expose `renderer.displayLayer` in a view.
     public nonisolated let renderer: SystemRenderer
     /// Active subtitle cues (embedded track or external file). Query with
@@ -150,6 +150,9 @@ public actor PlayerSession {
 
     /// The stage that stopped at the most recent `.stalled`; nil before any.
     public private(set) var lastStallReason: StallReason?
+
+    /// `systemUptime` until which the clock may not start (see `holdStart`).
+    private var startHoldDeadline: TimeInterval?
 
     // Startup timeline, `systemUptime` stamps (see `startup`).
     private var openStartedAt: TimeInterval?
@@ -423,6 +426,8 @@ public actor PlayerSession {
         public let replayedPackets: Int
         public let startup: StartupTimeline
         public let lastStallReason: StallReason?
+        /// The display mode the video wants (see `displayCriteria`).
+        public let displayCriteria: ContentDisplayCriteria?
 
         public var description: String {
             func lane(_ queue: (count: Int, seconds: Double)?, lead: Double, first: Double) -> String {
@@ -448,6 +453,7 @@ public actor PlayerSession {
                 timelineSeams, replayedPackets
             )
             if let lastStallReason { line += " stall=\(lastStallReason.rawValue)" }
+            if let displayCriteria { line += " display=\(displayCriteria)" }
             line += " startup=[\(startup)]"
             return line
         }
@@ -483,8 +489,37 @@ public actor PlayerSession {
             timelineSeams: demuxer?.timelineSeams ?? 0,
             replayedPackets: demuxer?.replayedPackets ?? 0,
             startup: startup,
-            lastStallReason: lastStallReason
+            lastStallReason: lastStallReason,
+            displayCriteria: displayCriteria
         )
+    }
+
+    // MARK: Start hold
+
+    /// Keeps the clock from starting — the session buffers and stays in
+    /// `.buffering` — until `releaseStartHold()` or until `seconds` have
+    /// passed, whichever comes first. For a host that has to wait for
+    /// something outside the engine before the first frame is worth showing:
+    /// a TV switching display mode blanks for seconds, and playback started
+    /// into that blank loses its opening (see `DisplayCriteriaMatcher`).
+    /// Bounded here, not by the caller, so a host that never releases cannot
+    /// wedge the session. Ignored once playing: a running clock is not
+    /// stopped, and a later rebuffer must not wait on a stale hold.
+    public func holdStart(for seconds: Double) {
+        guard seconds > 0, state != .playing else { return }
+        startHoldDeadline = ProcessInfo.processInfo.systemUptime + min(seconds, 30)
+    }
+
+    /// Lets a held start go ahead (see `holdStart`). Idempotent.
+    public func releaseStartHold() {
+        guard startHoldDeadline != nil else { return }
+        startHoldDeadline = nil
+        evaluatePlayback()
+    }
+
+    public var isStartHeld: Bool {
+        guard let deadline = startHoldDeadline else { return false }
+        return ProcessInfo.processInfo.systemUptime < deadline
     }
 
     // MARK: Seek
@@ -565,6 +600,7 @@ public actor PlayerSession {
     // MARK: Track-lane internals (used by PlayerSession+Tracks.swift)
 
     var activeDemuxer: Demuxer? { demuxer }
+    var activeVideoDecoder: VideoDecoder? { videoDecoder }
 
     /// Packet channels are budgeted in media time (`packetReadAhead`); the
     /// element counts are memory backstops for streams that report no packet
@@ -878,6 +914,7 @@ public actor PlayerSession {
             && (state == .playing || state == .buffering)
             && pendingSeekTarget == nil
             && !demuxAtEOF
+            && !isStartHeld // buffers fill and stop growing while held
 
         guard expectingProgress else {
             lastProgressDate = .distantFuture
@@ -1010,6 +1047,11 @@ public actor PlayerSession {
 
         switch state {
         case .ready, .paused, .buffering:
+            if isStartHeld {
+                if state != .buffering { state = .buffering }
+                return
+            }
+            startHoldDeadline = nil
             // Start when every lane is as buffered as it can usefully get,
             // or when EOF means no more is coming.
             if allLanesReady || allEOF || demuxAtEOF {

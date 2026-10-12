@@ -51,6 +51,24 @@ public final class LumePlayer {
     /// layer tree directly (UIKit/AppKit).
     public var displayLayer: LumeDisplayLayer? { session?.renderer.displayLayer }
 
+    /// tvOS: switch the TV to each loaded stream's refresh rate and dynamic
+    /// range (Match Content) while it plays in a `LumePlayerView`, which
+    /// supplies the window; `stop()` and the view going away hand the display
+    /// back. Set before `load`. Off by default; ignored on other platforms.
+    public var matchesDisplayCriteria = false {
+        didSet {
+            #if os(tvOS)
+            if !matchesDisplayCriteria { displayMatcher.reset() }
+            #endif
+        }
+    }
+
+    #if os(tvOS)
+    /// One per player, so loading the next stream does not hand the display
+    /// back in between (see `DisplayCriteriaMatcher`).
+    let displayMatcher = DisplayCriteriaMatcher()
+    #endif
+
     private var session: PlayerSession?
     private var eventTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -86,6 +104,10 @@ public final class LumePlayer {
 
         do {
             let info = try await session.open(url: url)
+            #if os(tvOS)
+            // Before the app's play(): the start is held while the TV switches.
+            if matchesDisplayCriteria { await displayMatcher.match(session) }
+            #endif
             mediaInfo = info
             duration = info.duration.map(MediaTime.seconds)
             return info
@@ -135,6 +157,9 @@ public final class LumePlayer {
     }
 
     public func stop() async {
+        #if os(tvOS)
+        displayMatcher.reset()
+        #endif
         await teardownSession()
         state = .idle
         position = 0

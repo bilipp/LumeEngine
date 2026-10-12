@@ -1,3 +1,5 @@
+import Foundation
+
 /// Engine-facing description of one stream in the container.
 /// Pure value type — built once at open, never mutated.
 public struct TrackInfo: Sendable, Identifiable, Equatable {
@@ -21,6 +23,13 @@ public struct TrackInfo: Sendable, Identifiable, Equatable {
         public let colorTransfer: UInt32
         public let colorSpace: UInt32
         public let colorRangeFull: Bool
+        /// Whether the stream is coded interlaced, from the field order the
+        /// container or codec reports; nil when it reports none. A prediction
+        /// only: whether frames really come out interlaced is decided per
+        /// frame (`VideoDecoder.isDeinterlacing`).
+        public let isInterlaced: Bool?
+        /// The stream's Dolby Vision configuration record; nil when it has none.
+        public let dolbyVision: DolbyVisionConfiguration?
     }
 
     public struct Audio: Sendable, Equatable {
@@ -55,6 +64,80 @@ public struct TrackInfo: Sendable, Identifiable, Equatable {
     /// streams. Such tracks are listed but never chosen automatically;
     /// selecting one explicitly ends in a `.decoderInitFailed` error.
     public internal(set) var isDecodable = true
+}
+
+/// A Dolby Vision decoder configuration record (`dvcC`/`dvvC`/`dvwC`), as the
+/// container or the stream's descriptor carries it.
+public struct DolbyVisionConfiguration: Sendable, Equatable {
+    public let versionMajor: UInt8
+    public let versionMinor: UInt8
+    public let profile: UInt8
+    public let level: UInt8
+    public let hasRPU: Bool
+    public let hasEnhancementLayer: Bool
+    public let hasBaseLayer: Bool
+    /// What the base layer is on its own: 0 none (IPTPQc2), 1 HDR10, 2 SDR,
+    /// 4 HLG, 6 BT.2020 HDR10.
+    public let baseLayerCompatibilityID: UInt8
+    public let metadataCompression: UInt8
+
+    public init(
+        versionMajor: UInt8 = 1,
+        versionMinor: UInt8 = 0,
+        profile: UInt8,
+        level: UInt8,
+        hasRPU: Bool = true,
+        hasEnhancementLayer: Bool = false,
+        hasBaseLayer: Bool = true,
+        baseLayerCompatibilityID: UInt8,
+        metadataCompression: UInt8 = 0
+    ) {
+        self.versionMajor = versionMajor
+        self.versionMinor = versionMinor
+        self.profile = profile
+        self.level = level
+        self.hasRPU = hasRPU
+        self.hasEnhancementLayer = hasEnhancementLayer
+        self.hasBaseLayer = hasBaseLayer
+        self.baseLayerCompatibilityID = baseLayerCompatibilityID
+        self.metadataCompression = metadataCompression
+    }
+
+    /// The base layer is IPTPQc2 rather than a displayable fallback (HDR10,
+    /// SDR, HLG): profiles 5, 10.0 and 20. The engine converts these to HDR10
+    /// (`DolbyVisionConverter`). Profile 4 also reports ID 0, but its base
+    /// layer is SDR plus an enhancement layer this engine does not decode.
+    public var baseLayerIsIPT: Bool {
+        baseLayerCompatibilityID == 0 && [5, 10, 20].contains(profile)
+    }
+
+    /// The ISO BMFF box the record travels in: `dvcC` up to profile 7, `dvvC`
+    /// for 8–10, `dvwC` beyond.
+    var boxType: String {
+        profile > 10 ? "dvwC" : profile > 7 ? "dvvC" : "dvcC"
+    }
+
+    /// The record serialized as that box's 24-byte payload (Dolby Vision
+    /// Streams Within the ISO Base Media File Format, §3.2).
+    var boxPayload: Data {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        bytes[0] = versionMajor
+        bytes[1] = versionMinor
+        // profile(7) level(6) rpu(1) el(1) bl(1) compatibility(4) compression(2), then reserved.
+        var bits: UInt32 = 0
+        bits |= UInt32(profile & 0x7F) << 25
+        bits |= UInt32(level & 0x3F) << 19
+        bits |= (hasRPU ? 1 : 0) << 18
+        bits |= (hasEnhancementLayer ? 1 : 0) << 17
+        bits |= (hasBaseLayer ? 1 : 0) << 16
+        bits |= UInt32(baseLayerCompatibilityID & 0x0F) << 12
+        bits |= UInt32(metadataCompression & 0x03) << 10
+        bytes[2] = UInt8(truncatingIfNeeded: bits >> 24)
+        bytes[3] = UInt8(truncatingIfNeeded: bits >> 16)
+        bytes[4] = UInt8(truncatingIfNeeded: bits >> 8)
+        bytes[5] = UInt8(truncatingIfNeeded: bits)
+        return Data(bytes)
+    }
 }
 
 /// A chapter marker, in engine microseconds.
