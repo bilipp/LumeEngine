@@ -81,6 +81,19 @@ extension TrackInfo {
 
         codecName = String(cString: avcodec_get_name(par.codec_id))
         codecID = par.codec_id.rawValue
+        // The same lookups the lanes make when they open; a bare
+        // `avcodec_find_decoder` would misjudge AV1 (see VideoDecoder).
+        switch par.codec_type {
+        case AVMEDIA_TYPE_VIDEO:
+            isDecodable = VideoDecoder.decoder(for: par.codec_id, hardware: true) != nil
+                || VideoDecoder.decoder(for: par.codec_id, hardware: false) != nil
+        case AVMEDIA_TYPE_AUDIO:
+            isDecodable = AudioDecoder.decoder(for: par.codec_id) != nil
+        case AVMEDIA_TYPE_SUBTITLE:
+            isDecodable = SubtitleDecoder.decoder(for: par.codec_id) != nil
+        default:
+            isDecodable = false
+        }
         bitrate = par.bit_rate
 
         let meta = MediaInfo.dictionary(from: st.metadata)

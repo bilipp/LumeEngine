@@ -95,13 +95,13 @@ extension PlayerSession {
         var iterator = demuxer.events.makeAsyncIterator()
         guard case .opened(let info)? = await iterator.next() else {
             demuxer.shutdown()
-            throw EngineError(code: .openFailed, message: "cannot open subtitle file \(url)")
+            throw EngineError(code: .openFailed, message: "cannot open subtitle file \(LogRedaction.redact(url: url))")
         }
         guard let track = info.subtitleTracks.first,
               let parameters = demuxer.codecParameters(forStream: track.index)
         else {
             demuxer.shutdown()
-            throw EngineError(code: .unsupported, message: "no subtitle track in \(url)")
+            throw EngineError(code: .unsupported, message: "no subtitle track in \(LogRedaction.redact(url: url))")
         }
 
         let packets = Channel<Packet>(capacity: 512)

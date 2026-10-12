@@ -14,7 +14,8 @@ public final class SystemRenderer: @unchecked Sendable {
     /// The layer to install in the view hierarchy.
     public let displayLayer: AVSampleBufferDisplayLayer
 
-    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    /// Internal for `observeTransport` (SystemRenderer+Transport.swift).
+    let synchronizer = AVSampleBufferRenderSynchronizer()
     private let videoRenderer: AVSampleBufferVideoRenderer
     let audioRenderer = AVSampleBufferAudioRenderer()
 
