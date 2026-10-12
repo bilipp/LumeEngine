@@ -47,7 +47,11 @@ public enum FFmpegRuntime {
         avutil_version() >> 16
     }
 
-    fileprivate static func log(level: Int32, message: String) {
+    /// Public so a sysdiagnose shows what went wrong — after the source URL's
+    /// credentials are gone (see `LogRedaction`): FFmpeg names playlist,
+    /// segment and key URLs in its warnings.
+    fileprivate static func log(level: Int32, message rawMessage: String) {
+        let message = LogRedaction.redact(rawMessage)
         switch level {
         case ...AV_LOG_ERROR: logger.error("\(message, privacy: .public)")
         case ...AV_LOG_WARNING: logger.warning("\(message, privacy: .public)")
