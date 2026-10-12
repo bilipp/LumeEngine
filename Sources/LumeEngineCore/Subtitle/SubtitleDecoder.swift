@@ -64,6 +64,16 @@ public final class SubtitleDecoder: @unchecked Sendable {
         return true
     }
 
+    /// Stops the decode thread without waiting for it to exit. Once this
+    /// returns, no further cue reaches the store, so a session switching tracks
+    /// can clear the store at once and leave the join to another thread.
+    func requestStop() {
+        lock.lock()
+        stopRequested = true
+        lock.unlock()
+        input.close()
+    }
+
     @discardableResult
     public func shutdown(deadline: TimeInterval = 5.0) -> Bool {
         lock.lock()
@@ -143,6 +153,12 @@ public final class SubtitleDecoder: @unchecked Sendable {
             }
         }
         let text = lines.joined(separator: "\n")
+        // Checked under the lock a stop is requested under: a cue decoded
+        // while the lane was being retired must not land after the session
+        // cleared the store for the next track (see `requestStop`).
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopRequested else { return }
         store.insert(start: start, end: end, text: text)
     }
 

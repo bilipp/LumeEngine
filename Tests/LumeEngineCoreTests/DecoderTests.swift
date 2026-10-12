@@ -241,11 +241,16 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        var count = 0
-        var softwareFrames = 0
-        while let frame = frames.receive(timeout: 5) {
-            count += 1
-            if !frame.isHardwareDecoded { softwareFrames += 1 }
+        // `receive` blocks: read on a thread of its own, never on the test's
+        // cooperative thread (see `ChannelDrain`).
+        let (count, softwareFrames) = await DedicatedThread.run(named: "test.frame-reader") {
+            var count = 0
+            var softwareFrames = 0
+            while let frame = frames.receive(timeout: 5) {
+                count += 1
+                if !frame.isHardwareDecoded { softwareFrames += 1 }
+            }
+            return (count, softwareFrames)
         }
         #expect(corrupted.get() >= 2, "the test must actually corrupt packets")
         #expect(count > 200, "decoding must continue past the corrupt packets, got \(count) frames")
@@ -270,12 +275,15 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        var count = 0
-        var sawHardwareFrame = false
-        while let frame = frames.receive(timeout: 5) {
-            count += 1
-            sawHardwareFrame = sawHardwareFrame || frame.isHardwareDecoded
-            if count == 60 { break }
+        let (count, sawHardwareFrame) = await DedicatedThread.run(named: "test.frame-reader") {
+            var count = 0
+            var sawHardwareFrame = false
+            while let frame = frames.receive(timeout: 5) {
+                count += 1
+                sawHardwareFrame = sawHardwareFrame || frame.isHardwareDecoded
+                if count == 60 { break }
+            }
+            return (count, sawHardwareFrame)
         }
         #expect(count == 60)
         #expect(!sawHardwareFrame, "software policy must never touch VideoToolbox")
@@ -352,7 +360,7 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        let frame = try #require(frames.receive(timeout: 5))
+        let frame = try #require(await DedicatedThread.run(named: "test.frame-reader") { frames.receive(timeout: 5) })
         defer { decoder.shutdown() }
         _ = demuxEvents
 
@@ -395,13 +403,17 @@ struct DecoderTests {
         decoder.start()
         demuxer.resume()
 
-        // Take a few serial-0 frames, then seek.
-        var initialFrames = 0
-        while initialFrames < 10, let frame = frames.receive(timeout: 5) {
-            #expect(frame.serial == 0)
-            initialFrames += 1
+        // Take a few serial-0 frames, then seek. Reading happens on a thread
+        // of its own (`receive` blocks); the assertions stay in the test.
+        let initialSerials = await DedicatedThread.run(named: "test.frame-reader") {
+            var serials: [UInt64] = []
+            while serials.count < 10, let frame = frames.receive(timeout: 5) {
+                serials.append(frame.serial)
+            }
+            return serials
         }
-        #expect(initialFrames == 10)
+        #expect(initialSerials.count == 10)
+        #expect(initialSerials.allSatisfy { $0 == 0 })
 
         // Session-style seek: flush downstream, then reposition the demuxer.
         packets.flush()
@@ -410,15 +422,16 @@ struct DecoderTests {
 
         // Frames still in flight may carry serial 0; once serial 1 appears,
         // nothing may ever regress to serial 0.
-        var sawNewSerial = false
-        var post: [VideoFrame] = []
-        while post.count < 30, let frame = frames.receive(timeout: 5) {
-            if frame.serial == 1 { sawNewSerial = true }
-            if sawNewSerial {
-                #expect(frame.serial == 1, "no stale-serial frame may follow a new-serial frame")
-                post.append(frame)
+        let (sawNewSerial, post) = await DedicatedThread.run(named: "test.frame-reader") {
+            var sawNewSerial = false
+            var post: [VideoFrame] = []
+            while post.count < 30, let frame = frames.receive(timeout: 5) {
+                if frame.serial == 1 { sawNewSerial = true }
+                if sawNewSerial { post.append(frame) }
             }
+            return (sawNewSerial, post)
         }
+        #expect(post.allSatisfy { $0.serial == 1 }, "no stale-serial frame may follow a new-serial frame")
         #expect(sawNewSerial, "expected serial-1 frames after seek")
         if let first = post.first {
             let position = MediaTime.seconds(first.pts - info.startTime)

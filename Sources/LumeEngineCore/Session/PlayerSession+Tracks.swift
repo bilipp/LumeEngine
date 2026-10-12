@@ -93,14 +93,15 @@ extension PlayerSession {
         demuxer.start()
 
         var iterator = demuxer.events.makeAsyncIterator()
+        // Every join below runs off the actor (see `DedicatedThread`).
         guard case .opened(let info)? = await iterator.next() else {
-            demuxer.shutdown()
+            await DedicatedThread.run(named: "engine.lume.subtitle-loader") { demuxer.shutdown() }
             throw EngineError(code: .openFailed, message: "cannot open subtitle file \(LogRedaction.redact(url: url))")
         }
         guard let track = info.subtitleTracks.first,
               let parameters = demuxer.codecParameters(forStream: track.index)
         else {
-            demuxer.shutdown()
+            await DedicatedThread.run(named: "engine.lume.subtitle-loader") { demuxer.shutdown() }
             throw EngineError(code: .unsupported, message: "no subtitle track in \(LogRedaction.redact(url: url))")
         }
 
@@ -114,13 +115,17 @@ extension PlayerSession {
         while let event = await iterator.next() {
             if case .endOfStream = event { break }
             if case .failed(let error) = event {
-                demuxer.shutdown()
-                decoder.shutdown()
+                await DedicatedThread.run(named: "engine.lume.subtitle-loader") {
+                    demuxer.shutdown()
+                    decoder.shutdown()
+                }
                 throw error
             }
         }
-        demuxer.shutdown() // closes the packet channel → decoder drains and stops
-        decoder.drainAndShutdown() // shutdown() would race the drain and drop trailing cues
+        await DedicatedThread.run(named: "engine.lume.subtitle-loader") {
+            demuxer.shutdown() // closes the packet channel → decoder drains and stops
+            decoder.drainAndShutdown() // shutdown() would race the drain and drop trailing cues
+        }
         markExternalSubtitlesActive()
     }
 }
