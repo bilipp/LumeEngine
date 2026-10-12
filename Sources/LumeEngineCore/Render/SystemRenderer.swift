@@ -32,6 +32,10 @@ public final class SystemRenderer: @unchecked Sendable {
     private var lastEnqueuedAudioPTS = MediaTime.noTimestamp
     private var firstEnqueuedVideoPTS = MediaTime.noTimestamp
     private var firstEnqueuedAudioPTS = MediaTime.noTimestamp
+    /// `systemUptime` of the first frame each lane ever enqueued (never reset
+    /// by a flush): startup diagnostics.
+    private var firstVideoEnqueue: TimeInterval?
+    private var firstAudioEnqueue: TimeInterval?
     private var videoPumpScheduled = false
     private var audioPumpScheduled = false
     private var stopped = false
@@ -332,6 +336,14 @@ public final class SystemRenderer: @unchecked Sendable {
         return (firstEnqueuedVideoPTS, firstEnqueuedAudioPTS)
     }
 
+    /// `systemUptime` of the first decoded frame each lane handed to its
+    /// renderer; nil until it has. Startup diagnostics.
+    var firstEnqueueUptime: (video: TimeInterval?, audio: TimeInterval?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (firstVideoEnqueue, firstAudioEnqueue)
+    }
+
     /// Raw renderer health for diagnostics (status is
     /// `AVQueuedSampleBufferRenderingStatus`: 0 unknown, 1 rendering, 2 failed).
     public var rendererHealth: (videoStatus: Int, audioStatus: Int, videoError: String?, audioError: String?) {
@@ -388,6 +400,7 @@ public final class SystemRenderer: @unchecked Sendable {
                 lock.lock()
                 lastEnqueuedVideoPTS = frame.pts
                 if !MediaTime.isValid(firstEnqueuedVideoPTS) { firstEnqueuedVideoPTS = frame.pts }
+                if firstVideoEnqueue == nil { firstVideoEnqueue = ProcessInfo.processInfo.systemUptime }
                 lock.unlock()
             } catch {
                 continue // malformed frame: drop, keep the pump alive
@@ -419,6 +432,7 @@ public final class SystemRenderer: @unchecked Sendable {
                 lock.lock()
                 lastEnqueuedAudioPTS = frame.pts + frame.duration
                 if !MediaTime.isValid(firstEnqueuedAudioPTS) { firstEnqueuedAudioPTS = frame.pts }
+                if firstAudioEnqueue == nil { firstAudioEnqueue = ProcessInfo.processInfo.systemUptime }
                 lock.unlock()
                 retainAudio(sample, serial: serial, end: frame.pts + frame.duration)
             } catch {

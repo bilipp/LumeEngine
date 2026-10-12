@@ -60,12 +60,20 @@ public final class Demuxer: @unchecked Sendable {
     /// `TimelineFolder`); continuous streams are the ones that detect them.
     private var folder = TimelineFolder()
     private var continuousStreams: Set<Int32> = []
+    /// Drops what a reconnected source sends a second time (see `ReplayFilter`).
+    private var replays = ReplayFilter()
+    /// Per stream, a packet `ReplayFilter` called suspect, until the stream's
+    /// next packet decides it. Owned: freed if never released.
+    private var heldSuspects: [Int32: (packet: ReadPacket, closesReplay: Bool)] = [:]
+    private var deliveredAny = false
     private var timeBases: [Int32: AVRational] = [:]
     private var serial: UInt64 = 0
     private var atEOF = false
     private var consecutiveErrors = 0
-    /// Packet whose bounded send timed out; retried after the next command drain.
-    private var pendingSend: (packet: Packet, channel: Channel<Packet>)?
+    /// Packets whose bounded send timed out, in order; retried after the next
+    /// command drain. More than one when a held suspect is released together
+    /// with the packet that decided it.
+    private var pendingSends: [(packet: Packet, channel: Channel<Packet>)] = []
     /// Previous packet PTS per stream, for synthesizing missing durations
     /// (reader-thread-only; reset on seek).
     private var lastPTSByStream: [Int32: Int64] = [:]
@@ -73,6 +81,10 @@ public final class Demuxer: @unchecked Sendable {
     private var bytesDelivered: Int64 = 0
     // Guarded by `lock`: timeline seams folded since open (diagnostics).
     private var seamsFolded = 0
+    // Guarded by `lock`: replayed packets dropped since open (diagnostics).
+    private var replaysDropped = 0
+    // Guarded by `lock`: when the first packet reached an attached lane.
+    private var firstDelivery: TimeInterval?
 
     /// Total compressed bytes demuxed so far — diff over time for the
     /// effective network delivery rate.
@@ -88,6 +100,22 @@ public final class Demuxer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return seamsFolded
+    }
+
+    /// Packets dropped because the source sent them a second time, typically
+    /// right after FFmpeg reconnected — see `ReplayFilter`.
+    public var replayedPackets: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return replaysDropped
+    }
+
+    /// `ProcessInfo.systemUptime` when the first packet was handed to an
+    /// attached lane; nil until then. Startup diagnostics.
+    var firstPacketUptime: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstDelivery
     }
 
     /// Consecutive `av_read_frame` failures tolerated before declaring the
@@ -244,7 +272,7 @@ public final class Demuxer: @unchecked Sendable {
                 reading = true
                 atEOF = false
             case .seek(let target):
-                pendingSend = nil // pre-seek packet; downstream drops its serial anyway
+                pendingSends.removeAll() // pre-seek packets; downstream drops their serial anyway
                 performSeek(to: target)
                 atEOF = false
                 reading = true
@@ -259,11 +287,10 @@ public final class Demuxer: @unchecked Sendable {
             // command that cannot preempt a full pipeline deadlocks the
             // session (rate 0 + sated renderers = nothing ever drains).
             if reading && !atEOF {
-                if let pending = pendingSend {
-                    pendingSend = nil
-                    deliver(pending.packet, to: pending.channel)
-                } else {
+                if pendingSends.isEmpty {
                     readOnePacket(reading: &reading)
+                } else {
+                    flushPendingSends()
                 }
             } else if atEOF {
                 // Park until next command.
@@ -273,6 +300,7 @@ public final class Demuxer: @unchecked Sendable {
             }
         }
 
+        discardHeldSuspects()
         closeInput()
         finishThread()
     }
@@ -380,6 +408,8 @@ public final class Demuxer: @unchecked Sendable {
             normalizers[key]?.discontinuity()
         }
         folder.reset()
+        replays.reset()
+        discardHeldSuspects()
         lastPTSByStream.removeAll()
         consecutiveErrors = 0
         eventSink.yield(.didSeek(to: target, serial: serial))
@@ -394,6 +424,7 @@ public final class Demuxer: @unchecked Sendable {
             av_packet_free(&toFree)
 
             if lume_is_eof(result) != 0 {
+                discardHeldSuspects()
                 atEOF = true
                 eventSink.yield(.endOfStream(serial: serial))
             } else if result == lume_averror_exit() || cancelToken.isCancelled {
@@ -431,9 +462,62 @@ public final class Demuxer: @unchecked Sendable {
         let (unwrappedPts, unwrappedDts) = normalizers[streamIndex, default: StreamTimeNormalizer(wrapBits: 0)]
             .normalize(pts: rawPacket.pointee.pts, dts: rawPacket.pointee.dts)
 
-        var pts = MediaTime.fromStream(unwrappedPts, timeBase: timeBase)
-        var dts = MediaTime.fromStream(unwrappedDts, timeBase: timeBase)
-        var duration = MediaTime.fromStream(rawPacket.pointee.duration, timeBase: timeBase)
+        let read = ReadPacket(
+            raw: rawPacket,
+            stream: streamIndex,
+            pts: MediaTime.fromStream(unwrappedPts, timeBase: timeBase),
+            dts: MediaTime.fromStream(unwrappedDts, timeBase: timeBase),
+            duration: MediaTime.fromStream(rawPacket.pointee.duration, timeBase: timeBase)
+        )
+
+        // A reconnected source repeats what it already sent (see
+        // `ReplayFilter`). Judged on the source's own time, before folding:
+        // that is what the server repeats, and folded first, the repeat would
+        // become a seam. A suspect waits for the stream's next packet.
+        let verdict = replays.classify(stream: streamIndex, time: read.time, size: read.size)
+        if let held = heldSuspects.removeValue(forKey: streamIndex) {
+            if replays.settleSuspect(
+                stream: streamIndex,
+                time: held.packet.time,
+                size: held.packet.size,
+                closesReplay: held.closesReplay,
+                followedBy: verdict
+            ) {
+                held.packet.free()
+            } else {
+                process(held.packet, to: channel)
+            }
+        }
+        switch verdict {
+        case .replay:
+            read.free()
+        case .suspect(let closesReplay):
+            heldSuspects[streamIndex] = (read, closesReplay)
+        case .new:
+            process(read, to: channel)
+        }
+        let dropped = replays.replayedCount
+        if dropped != replaysDropped {
+            lock.lock()
+            replaysDropped = dropped
+            lock.unlock()
+        }
+    }
+
+    /// Suspects still held when the stream ends or seeks: never confirmed as
+    /// new media, and one packet at a boundary is not worth stalling for.
+    private func discardHeldSuspects() {
+        for held in heldSuspects.values { held.packet.free() }
+        heldSuspects.removeAll()
+    }
+
+    /// Fold, fill in timing, and hand a packet read in engine time downstream.
+    private func process(_ read: ReadPacket, to channel: Channel<Packet>) {
+        let rawPacket = read.raw
+        let streamIndex = read.stream
+        var pts = read.pts
+        var dts = read.dts
+        var duration = read.duration
 
         // Fold encoder restarts and chunk seams out of the timeline. The
         // folder sees every packet of every attached stream, so a seam is
@@ -476,6 +560,13 @@ public final class Demuxer: @unchecked Sendable {
         rawPacket.pointee.dts = dts
         rawPacket.pointee.duration = max(duration, 0)
 
+        if !deliveredAny {
+            deliveredAny = true
+            lock.lock()
+            firstDelivery = ProcessInfo.processInfo.systemUptime
+            lock.unlock()
+        }
+
         let packet = Packet(
             adopting: rawPacket,
             pts: pts,
@@ -488,13 +579,19 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     /// Bounded send = backpressure that stays command-responsive: when the
-    /// channel is still full after the timeout, the packet is parked in
-    /// `pendingSend` and the main loop retries after draining commands. A
+    /// channel is still full after the timeout, the packet waits in
+    /// `pendingSends` and the main loop retries after draining commands. A
     /// closed channel (teardown/track switch mid-flight) just drops the
     /// packet and keeps the loop responsive.
     private func deliver(_ packet: Packet, to channel: Channel<Packet>) {
-        if let sent = try? channel.send(packet, timeout: 0.1), !sent {
-            pendingSend = (packet, channel)
+        pendingSends.append((packet, channel))
+        flushPendingSends()
+    }
+
+    private func flushPendingSends() {
+        while let next = pendingSends.first {
+            if let sent = try? next.channel.send(next.packet, timeout: 0.1), !sent { return }
+            pendingSends.removeFirst()
         }
     }
 
@@ -517,6 +614,25 @@ public final class Demuxer: @unchecked Sendable {
         for channel in channels { channel.close() }
         eventSink.yield(.closed)
         eventSink.finish()
+    }
+}
+
+/// A packet read and rescaled to engine time, before seam folding. Reader
+/// thread only; owns `raw` until it is processed or freed.
+private struct ReadPacket {
+    let raw: UnsafeMutablePointer<AVPacket>
+    let stream: Int32
+    let pts: Int64
+    let dts: Int64
+    let duration: Int64
+
+    /// What `ReplayFilter` keys on: DTS, or PTS when there is no DTS.
+    var time: Int64 { MediaTime.isValid(dts) ? dts : pts }
+    var size: Int32 { raw.pointee.size }
+
+    func free() {
+        var toFree: UnsafeMutablePointer<AVPacket>? = raw
+        av_packet_free(&toFree)
     }
 }
 

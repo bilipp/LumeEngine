@@ -162,6 +162,50 @@ struct DemuxerTests {
         #expect(demuxer.shutdown())
     }
 
+    @Test("seconds a reconnected source sends again are dropped, not played twice")
+    func replayedSeconds() async throws {
+        // replay.ts jumps back ~3 s at ~6 s, byte for byte what a server that
+        // answers a reconnect from its buffer sends.
+        let demuxer = Demuxer(url: try Fixtures.path("replay.ts"))
+        var events = demuxer.events.makeAsyncIterator()
+        demuxer.start()
+
+        guard case .opened(let info)? = await nextEvent(&events) else {
+            Issue.record("expected .opened"); demuxer.shutdown(); return
+        }
+        let videoIndex = try #require(info.videoTracks.first?.index)
+        let audioIndex = try #require(info.audioTracks.first?.index)
+        let videoChannel = Channel<Packet>(capacity: 4096)
+        let audioChannel = Channel<Packet>(capacity: 4096)
+        demuxer.attach(channel: videoChannel, toStream: videoIndex)
+        demuxer.attach(channel: audioChannel, toStream: audioIndex)
+        demuxer.resume()
+
+        guard case .endOfStream? = await nextEvent(&events, timeout: 20) else {
+            Issue.record("expected .endOfStream"); demuxer.shutdown(); return
+        }
+
+        for (label, channel) in [("video", videoChannel), ("audio", audioChannel)] {
+            var dts: [Int64] = []
+            while let packet = channel.tryReceive() {
+                if MediaTime.isValid(packet.dts) { dts.append(packet.dts) }
+            }
+            #expect(
+                zip(dts, dts.dropFirst()).allSatisfy { $0 < $1 },
+                "\(label): no packet may arrive twice or out of order"
+            )
+            if let first = dts.first, let last = dts.last {
+                let span = MediaTime.seconds(last - first)
+                #expect(span > 7.0 && span < 8.5, "\(label): the 8 s source must span ~8 s, got \(span)")
+            }
+        }
+        #expect(demuxer.replayedPackets > 100, "~3 s of video and audio arrive twice, dropped \(demuxer.replayedPackets)")
+        #expect(demuxer.timelineSeams == 0, "a replay is not a seam")
+        #expect(demuxer.firstPacketUptime != nil)
+
+        #expect(demuxer.shutdown())
+    }
+
     @Test("seek bumps serial; new packets carry the new serial from a keyframe")
     func seek() async throws {
         let demuxer = Demuxer(url: try Fixtures.path("basic.mp4"))
