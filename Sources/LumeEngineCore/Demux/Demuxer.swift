@@ -1,5 +1,6 @@
 internal import CFFmpeg
 import Foundation
+import Synchronization
 
 /// Events emitted by the demuxer on its own thread, consumed via `events`.
 public enum DemuxEvent: Sendable {
@@ -315,16 +316,14 @@ public final class Demuxer: @unchecked Sendable {
         // Open deadline: a stalled source with no I/O timeout must not hang
         // open + probing forever. The watchdog fires the interrupt callback,
         // which aborts avformat_open_input / find_stream_info with EXIT.
-        let openCompleted = CancelToken()
+        let deadline = OpenDeadline()
         if let openTimeout = options.openTimeout {
             let token = cancelToken
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + openTimeout) {
-                if !openCompleted.isCancelled {
-                    token.cancel()
-                }
+                deadline.expire(cancelling: token)
             }
         }
-        defer { openCompleted.cancel() }
+        defer { _ = deadline.finish() }
 
         // Retained handoff to FFmpeg's interrupt callback; balanced in closeInput()
         // *after* avformat_close_input — the callback can never see a freed token.
@@ -341,15 +340,32 @@ public final class Demuxer: @unchecked Sendable {
         guard openResult >= 0, let openedCtx = ctx else {
             // avformat_open_input frees ctx on failure.
             tokenRef.release()
-            eventSink.yield(.openFailed(.ffmpeg(openResult, code: .openFailed, context: "avformat_open_input")))
+            let expired = deadline.finish()
+            eventSink.yield(.openFailed(expired
+                ? openTimedOut()
+                : .ffmpeg(openResult, code: .openFailed, context: "avformat_open_input")))
             return false
         }
         formatContext = openedCtx
 
         let infoResult = avformat_find_stream_info(openedCtx, nil)
+        let expired = deadline.finish()
         guard infoResult >= 0 else {
             closeInput()
-            eventSink.yield(.openFailed(.ffmpeg(infoResult, code: .openFailed, context: "avformat_find_stream_info")))
+            eventSink.yield(.openFailed(expired
+                ? openTimedOut()
+                : .ffmpeg(infoResult, code: .openFailed, context: "avformat_find_stream_info")))
+            return false
+        }
+        // An interrupted probe can still succeed: the MPEG-TS demuxer returns
+        // what it has when its read is aborted. But the interrupt cancelled
+        // the session's token for good, so every later read would abort too,
+        // and the session would open onto a source that never delivers.
+        guard !expired, !cancelToken.isCancelled else {
+            closeInput()
+            eventSink.yield(.openFailed(expired
+                ? openTimedOut()
+                : EngineError(code: .cancelled, message: "open cancelled")))
             return false
         }
 
@@ -379,6 +395,11 @@ public final class Demuxer: @unchecked Sendable {
 
         eventSink.yield(.opened(MediaInfo(context: openedCtx)))
         return true
+    }
+
+    private func openTimedOut() -> EngineError {
+        let seconds = options.openTimeout.map { String(format: "%.0f s", $0) } ?? "the deadline"
+        return EngineError(code: .openFailed, message: "open timed out after \(seconds): the source stopped delivering while it was probed")
     }
 
     private func applyDiscardFlags() {
@@ -633,6 +654,33 @@ private struct ReadPacket {
     func free() {
         var toFree: UnsafeMutablePointer<AVPacket>? = raw
         av_packet_free(&toFree)
+    }
+}
+
+/// The open deadline, shared by the reader thread and the timer that enforces
+/// it. One lock decides which happened first, so the deadline either expires
+/// before open finished (and the open fails) or not at all: a timer that
+/// fired just as open completed must not cancel the I/O of a session that
+/// goes on to play.
+private final class OpenDeadline: Sendable {
+    private let state = Mutex((finished: false, expired: false))
+
+    /// Timer side: expires the deadline and interrupts I/O, unless open already finished.
+    func expire(cancelling token: CancelToken) {
+        let interrupt = state.withLock { state -> Bool in
+            guard !state.finished else { return false }
+            state.expired = true
+            return true
+        }
+        if interrupt { token.cancel() }
+    }
+
+    /// Reader side: open is over. Returns whether the deadline expired first.
+    func finish() -> Bool {
+        state.withLock { state in
+            state.finished = true
+            return state.expired
+        }
     }
 }
 
