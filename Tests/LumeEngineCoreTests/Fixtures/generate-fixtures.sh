@@ -18,6 +18,7 @@
 #   replay.ts      — 8 s TS whose bytes jump back ~3 s at ~6 s, as a reconnect replays them
 #   ac4.ts         — TS whose first audio (ger) is declared AC-4, which no decoder here plays, then eng AAC
 #   hdr10.mp4      — HEVC Main 10, BT.2020 PQ, mastering display + content light level SEI, HDR10+ per frame
+#   surround51.ts  — 20 s H.264 + AC-3 5.1 MPEG-TS, tone in the centre channel only
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -328,5 +329,16 @@ JSON
     rm -f "$OUT/hdr10plus.json"
     echo "generated: $OUT/hdr10.mp4"
 fi
+
+# Broadcast surround the way IPTV carries it: H.264 + AC-3 5.1 in MPEG-TS,
+# long enough to change the output route mid-playback. The tone sits in the
+# centre channel alone, so a fold-down that drops channels instead of mixing
+# them goes silent.
+gen surround51.ts \
+    -f lavfi -i "testsrc2=duration=20:size=320x180:rate=25" \
+    -f lavfi -i "sine=frequency=440:duration=20" \
+    -filter_complex "[1:a]pan=5.1(side)|FC=c0[a]" -map 0:v -map "[a]" \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+    -c:a ac3 -b:a 384k -shortest -f mpegts
 
 echo "fixtures ready in $OUT"

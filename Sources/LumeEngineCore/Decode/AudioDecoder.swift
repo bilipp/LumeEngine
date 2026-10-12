@@ -7,13 +7,15 @@ import Foundation
 /// FFmpeg audio decode + resample stage: `Channel<Packet>` in,
 /// `Channel<AudioFrame>` out.
 ///
-/// Output is always interleaved Float32 at the source sample rate, downmixed
-/// to at most `maxOutputChannels` — the single canonical format the renderer
-/// consumes. Sources with more channels than the output route can carry are
-/// downmixed here by swresample (normalized matrix); handing the sample-buffer
-/// renderer more channels than the route supports produces audibly broken
-/// output. Resampling context is rebuilt automatically when source parameters
-/// change mid-stream (codec/parameter changes are routine on IPTV).
+/// Output is always interleaved Float32 at the source sample rate, in the
+/// speaker layout `AudioLayoutPolicy` picks for the output route — the single
+/// canonical format the renderer consumes. Sources with more channels than
+/// the route carries are folded down here by swresample with an explicit
+/// matrix (`DownmixMatrix`); handing the sample-buffer renderer more channels
+/// than the route supports produces audibly broken output. The resampling
+/// context is rebuilt when source parameters change mid-stream (codec and
+/// parameter changes are routine on IPTV) and when the route's width changes
+/// (`AudioOutputRoute`), in both cases at a frame boundary.
 ///
 /// Decoded frames are coalesced to at least `minOutputDuration` before
 /// emission. Some codecs decode to frames far too small to schedule
@@ -42,6 +44,7 @@ public final class AudioDecoder: @unchecked Sendable {
     private var swrSourceFormat: Int32 = -1
     private var swrSourceRate: Int32 = -1
     private var swrSourceChannels: Int32 = -1
+    private var swrRouteChannels = -1
     private var outputLayout = AVChannelLayout()
     private var currentSerial: UInt64?
     private var consecutiveErrors = 0
@@ -59,7 +62,17 @@ public final class AudioDecoder: @unchecked Sendable {
     private static let minOutputDuration = 0.020
 
     private let maxConsecutiveErrors = 100
-    private let maxOutputChannels: Int
+    private let route: AudioOutputRoute
+    /// What the resampler currently produces. Guarded by `lock`.
+    private var appliedOutput: AudioOutputLayout?
+
+    /// The layout decoded audio currently leaves in, and the route width it
+    /// was chosen for; nil before the first frame.
+    public var currentOutput: AudioOutputLayout? {
+        lock.lock()
+        defer { lock.unlock() }
+        return appliedOutput
+    }
 
     /// Channel budget of the current output route. The renderer downstream
     /// cannot correctly render more channels than the route carries, so
@@ -72,7 +85,9 @@ public final class AudioDecoder: @unchecked Sendable {
     /// Feeding the renderer more channels than the session actually outputs
     /// fails the renderer outright (silence, wedged pipeline) — configuring
     /// the session for surround is the app's job (PLAN.md §2.1), the engine
-    /// just honors whatever was negotiated at session-creation time.
+    /// just honors whatever was negotiated. This reads it once, for a decoder
+    /// of fixed width; `PlayerSession` follows route changes instead
+    /// (`AudioOutputRoute`).
     public static func defaultMaxOutputChannels() -> Int {
         #if canImport(UIKit)
         return max(2, AVAudioSession.sharedInstance().outputNumberOfChannels)
@@ -84,16 +99,32 @@ public final class AudioDecoder: @unchecked Sendable {
         #endif
     }
 
-    public init(
+    /// A decoder whose output width is fixed at `maxOutputChannels`.
+    public convenience init(
         parameters: CodecParameters,
         input: Channel<Packet>,
         output: Channel<AudioFrame>,
         maxOutputChannels: Int = AudioDecoder.defaultMaxOutputChannels()
     ) {
+        self.init(
+            parameters: parameters,
+            input: input,
+            output: output,
+            route: AudioOutputRoute(outputChannels: maxOutputChannels)
+        )
+    }
+
+    /// A decoder whose output follows `route` as it changes.
+    public init(
+        parameters: CodecParameters,
+        input: Channel<Packet>,
+        output: Channel<AudioFrame>,
+        route: AudioOutputRoute
+    ) {
         self.parameters = parameters
         self.input = input
         self.output = output
-        self.maxOutputChannels = max(1, maxOutputChannels)
+        self.route = route
         var continuation: AsyncStream<DecodeEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
@@ -329,12 +360,17 @@ public final class AudioDecoder: @unchecked Sendable {
         let format = frame.pointee.format
         let rate = frame.pointee.sample_rate
         let channels = frame.pointee.ch_layout.nb_channels
+        let routeChannels = route.outputChannels
 
-        if swrContext != nil, format == swrSourceFormat, rate == swrSourceRate, channels == swrSourceChannels {
+        if swrContext != nil, format == swrSourceFormat, rate == swrSourceRate, channels == swrSourceChannels,
+           routeChannels == swrRouteChannels {
             return true
         }
 
-        emitPending() // samples of the previous format cannot share a buffer
+        // Samples of the previous layout cannot share a buffer. Same-rate
+        // conversion holds nothing back inside swr, so emitting the pending
+        // buffer is all a switch needs to land on a frame boundary.
+        emitPending()
         swr_free(&swrContext)
         // swr needs concrete layouts on both sides to build a (down)mix
         // matrix; sources reporting an unspecified order (routine for PCM)
@@ -346,12 +382,27 @@ public final class AudioDecoder: @unchecked Sendable {
             av_channel_layout_default(&inputLayout, channels)
         }
         defer { av_channel_layout_uninit(&inputLayout) }
+
         av_channel_layout_uninit(&outputLayout)
-        if channels > Int32(maxOutputChannels) {
-            av_channel_layout_default(&outputLayout, Int32(maxOutputChannels))
+        var matrix: [Double]?
+        if inputLayout.order == AV_CHANNEL_ORDER_NATIVE {
+            let source = SpeakerSet(rawValue: inputLayout.u.mask)
+            let plan = AudioLayoutPolicy.plan(source: source, routeChannels: routeChannels)
+            if plan.remixes {
+                av_channel_layout_from_mask(&outputLayout, plan.output.rawValue)
+                matrix = DownmixMatrix.flatCoefficients(from: source, to: plan.output)
+            } else {
+                av_channel_layout_copy(&outputLayout, &inputLayout)
+            }
+        } else if channels > Int32(routeChannels) {
+            // No positions to plan with (more channels than FFmpeg has a
+            // default order for): fold to the route's default layout and let
+            // swr do what it can.
+            av_channel_layout_default(&outputLayout, Int32(routeChannels))
         } else {
             av_channel_layout_copy(&outputLayout, &inputLayout)
         }
+
         var newContext: OpaquePointer?
         let result = swr_alloc_set_opts2(
             &newContext,
@@ -359,7 +410,16 @@ public final class AudioDecoder: @unchecked Sendable {
             &inputLayout, AVSampleFormat(rawValue: format), rate,
             0, nil
         )
+        // A custom matrix goes in between allocation and init. Without one
+        // (no remix, or a layout pair the builder refused) swr builds its own
+        // from the two layouts.
+        if result >= 0, let created = newContext, let matrix {
+            _ = matrix.withUnsafeBufferPointer {
+                swr_set_matrix(created, $0.baseAddress, Int32(DownmixMatrix.stride))
+            }
+        }
         guard result >= 0, let created = newContext, swr_init(created) >= 0 else {
+            swr_free(&newContext)
             handleDecodeError(nil, EngineError(code: .decodeFailed, message: "swresample init failed"))
             return false
         }
@@ -367,6 +427,15 @@ public final class AudioDecoder: @unchecked Sendable {
         swrSourceFormat = format
         swrSourceRate = rate
         swrSourceChannels = channels
+        swrRouteChannels = routeChannels
+        let applied = AudioOutputLayout(
+            sourceChannels: Int(channels),
+            outputChannels: Int(outputLayout.nb_channels),
+            routeChannels: routeChannels
+        )
+        lock.lock()
+        appliedOutput = applied
+        lock.unlock()
         return true
     }
 

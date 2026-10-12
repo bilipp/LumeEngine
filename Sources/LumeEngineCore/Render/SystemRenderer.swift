@@ -51,6 +51,8 @@ public final class SystemRenderer: @unchecked Sendable {
     private var audioFormatCache: (description: CMAudioFormatDescription, sampleRate: Int, channels: Int, channelBitmap: UInt64)?
     // Audio-queue-confined; serial changes re-anchor it after a seek flush.
     private var audioTimeline = AudioTimeline()
+    /// Route width at the previous audio pump pass. Audio-queue-confined.
+    private var lastAudioRouteChannels = Int.max
 
     /// Audio enqueued but not yet played, kept so it can be enqueued again
     /// after the renderer drops it on its own (see `refillAfterAutomaticFlush`).
@@ -60,6 +62,7 @@ public final class SystemRenderer: @unchecked Sendable {
         let serial: UInt64
         /// End of the sample on the engine timeline (µs).
         let end: Int64
+        let channels: Int
     }
     private var retainedAudio: [RetainedAudio] = []
     /// Backstop only: the renderer stops asking for audio once it holds a
@@ -88,7 +91,13 @@ public final class SystemRenderer: @unchecked Sendable {
     private var audioLaneAttached = false
     private var reportedFailure = false
 
-    public init(muted: Bool = false) {
+    /// The route the audio lane's decoder fits its output to. Audio decoded
+    /// for a wider route before it narrowed is held back from the renderer
+    /// (see `pumpAudio`); nil feeds every frame.
+    private let audioOutputRoute: AudioOutputRoute?
+
+    public init(muted: Bool = false, audioOutputRoute: AudioOutputRoute? = nil) {
+        self.audioOutputRoute = audioOutputRoute
         displayLayer = AVSampleBufferDisplayLayer()
         displayLayer.videoGravity = .resizeAspect
         videoRenderer = displayLayer.sampleBufferRenderer
@@ -171,7 +180,11 @@ public final class SystemRenderer: @unchecked Sendable {
         // answer; that audio is retained too, so drop it and re-enqueue
         // everything in order.
         audioRenderer.flush()
-        for entry in retainedAudio where entry.serial == serial && (!MediaTime.isValid(flushTime) || entry.end > flushTime) {
+        // A route change is the usual cause of the flush; audio retained for
+        // a wider route than the new one stays out (see `pumpAudio`).
+        let routeChannels = audioOutputRoute?.outputChannels ?? .max
+        for entry in retainedAudio where entry.serial == serial && entry.channels <= routeChannels
+            && (!MediaTime.isValid(flushTime) || entry.end > flushTime) {
             audioRenderer.enqueue(entry.sample)
         }
         // A seek that flushed while this ran may have been overtaken by the
@@ -371,6 +384,10 @@ public final class SystemRenderer: @unchecked Sendable {
         )
     }
 
+    var audioRendererFailed: Bool {
+        audioRenderer.status == .failed
+    }
+
     public func shutdown() {
         lock.lock()
         stopped = true
@@ -434,12 +451,25 @@ public final class SystemRenderer: @unchecked Sendable {
         lock.unlock()
         guard let input, !isStopped else { return }
 
+        // The route narrowed (HDMI surround → AirPlay stereo): audio already
+        // decoded for the wider route must not reach the renderer, which
+        // fails on more channels than the route carries. The decoder refits
+        // at its next frame; until then what is queued for the old width is
+        // dropped, and whatever the renderer still holds of it is replaced by
+        // the retained audio that fits — usually nothing, so the switch costs
+        // the renderer's lead in silence, as a route change does anyway.
+        let routeChannels = audioOutputRoute?.outputChannels ?? .max
+        if routeChannels < lastAudioRouteChannels {
+            refillAfterAutomaticFlush(from: currentTime)
+        }
+        lastAudioRouteChannels = routeChannels
+
         while audioRenderer.isReadyForMoreMediaData {
             guard let frame = input.tryReceive() else {
                 scheduleAudioRetry()
                 return
             }
-            guard frame.serial == serial else { continue }
+            guard frame.serial == serial, frame.channels <= routeChannels else { continue }
             do {
                 let sample = try SampleBufferBuilder.audio(
                     from: frame,
@@ -452,7 +482,7 @@ public final class SystemRenderer: @unchecked Sendable {
                 if !MediaTime.isValid(firstEnqueuedAudioPTS) { firstEnqueuedAudioPTS = frame.pts }
                 if firstAudioEnqueue == nil { firstAudioEnqueue = ProcessInfo.processInfo.systemUptime }
                 lock.unlock()
-                retainAudio(sample, serial: serial, end: frame.pts + frame.duration)
+                retainAudio(sample, serial: serial, end: frame.pts + frame.duration, channels: frame.channels)
             } catch {
                 continue
             }
@@ -460,13 +490,13 @@ public final class SystemRenderer: @unchecked Sendable {
     }
 
     /// Keeps `sample` until the clock has played past it. Audio queue only.
-    private func retainAudio(_ sample: CMSampleBuffer, serial: UInt64, end: Int64) {
+    private func retainAudio(_ sample: CMSampleBuffer, serial: UInt64, end: Int64, channels: Int) {
         let now = currentTime
         retainedAudio.removeAll { entry in
             entry.serial != serial || (MediaTime.isValid(now) && entry.end <= now)
         }
         if retainedAudio.count >= Self.maxRetainedAudio { retainedAudio.removeFirst() }
-        retainedAudio.append(RetainedAudio(sample: sample, serial: serial, end: end))
+        retainedAudio.append(RetainedAudio(sample: sample, serial: serial, end: end, channels: channels))
     }
 
     private func scheduleVideoRetry() {
