@@ -121,6 +121,7 @@ struct HardwareFailureBudgetTests {
     @Test("isolated failures with frames in between keep hardware")
     func isolated() {
         var budget = HardwareFailureBudget()
+        budget.recordFrame()
         // One failure a minute, recovering each time: a corrupt packet now
         // and then on an otherwise healthy channel.
         for minute in 0..<20 {
@@ -130,9 +131,17 @@ struct HardwareFailureBudgetTests {
         }
     }
 
+    @Test("a failure before the first frame gives up at once")
+    func neverDecoded() {
+        var budget = HardwareFailureBudget()
+        let gaveUp = budget.recordFailure(at: 0)
+        #expect(gaveUp)
+    }
+
     @Test("consecutive failures without a frame give up")
     func consecutive() {
         var budget = HardwareFailureBudget()
+        budget.recordFrame()
         let first = budget.recordFailure(at: 0)
         let second = budget.recordFailure(at: 1)
         let third = budget.recordFailure(at: 2)
@@ -143,6 +152,7 @@ struct HardwareFailureBudgetTests {
     @Test("frequent failures give up even when each one recovers")
     func frequent() {
         var budget = HardwareFailureBudget()
+        budget.recordFrame()
         var gaveUp = false
         for second in 0..<6 {
             gaveUp = budget.recordFailure(at: Double(second) * 4)
@@ -154,6 +164,7 @@ struct HardwareFailureBudgetTests {
     @Test("old failures age out of the window")
     func window() {
         var budget = HardwareFailureBudget()
+        budget.recordFrame()
         for second in 0..<5 {
             _ = budget.recordFailure(at: Double(second))
             budget.recordFrame()

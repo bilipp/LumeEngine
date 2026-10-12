@@ -12,6 +12,10 @@ import Foundation
 /// costs a flush and a resync at the next keyframe, and software only takes
 /// over when hardware keeps failing:
 ///
+/// - Any failure before hardware has produced its first frame: the session
+///   never worked, so there is nothing transient to wait out. VideoToolbox
+///   can accept a configuration it then fails on every frame (virtualized
+///   macOS claims AV1 that way), and each retry would cost a GOP of black.
 /// - `consecutiveLimit` failures with no frame decoded in between: the
 ///   hardware path is not coming back (an unsupported profile, a session
 ///   that cannot be rebuilt).
@@ -26,6 +30,7 @@ struct HardwareFailureBudget: Sendable {
     let window: TimeInterval
 
     private var consecutive = 0
+    private var hasDecoded = false
     private var recent: [TimeInterval] = []
 
     init(consecutiveLimit: Int = 3, windowLimit: Int = 6, window: TimeInterval = 30) {
@@ -37,6 +42,7 @@ struct HardwareFailureBudget: Sendable {
     /// A frame came out of the hardware decoder.
     mutating func recordFrame() {
         consecutive = 0
+        hasDecoded = true
     }
 
     /// Records a hardware failure at `now` (seconds on any monotonic clock).
@@ -45,6 +51,6 @@ struct HardwareFailureBudget: Sendable {
         consecutive += 1
         recent.removeAll { now - $0 > window }
         recent.append(now)
-        return consecutive >= consecutiveLimit || recent.count >= windowLimit
+        return !hasDecoded || consecutive >= consecutiveLimit || recent.count >= windowLimit
     }
 }
