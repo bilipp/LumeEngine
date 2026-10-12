@@ -505,7 +505,7 @@ struct AudioRouteSessionTests {
         #expect(await session.audioHealth == .healthy)
 
         // The renderer stops taking audio; the clock and the picture go on.
-        session.renderer.audioRenderer.stopRequestingMediaData()
+        session.renderer.stopFeedingAudio()
         let lost = await eventually(timeout: 15) { await session.audioHealth == .lost(.starved) }
         let health = await session.audioHealth
         #expect(lost, "lost audio must be detected, health is \(health)")
