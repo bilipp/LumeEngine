@@ -8,8 +8,9 @@ import Foundation
 /// Describes what the engine *outputs*, which is not what the container says.
 /// The deinterlacer at field rate turns 1080i50 into 50p, so the TV should
 /// run at 50 Hz, not 25; Dolby Vision with an IPT base layer (profiles 5,
-/// 10.0, 20) is converted to HDR10 before it is enqueued, so the TV should be
-/// in HDR10, not Dolby Vision. Frames the renderer has been handed decide when
+/// 10.0, 20) is converted to HDR10 before it is enqueued, and every other
+/// Dolby Vision profile is presented as its base layer (HDR10, HLG or SDR) —
+/// so the TV is asked for that, never for Dolby Vision. Frames the renderer has been handed decide when
 /// there are any (`basis == .output`); before that the stream's own metadata,
 /// with the deinterlacer's effect predicted, stands in (`.stream`).
 ///
@@ -20,6 +21,11 @@ public struct ContentDisplayCriteria: Sendable, Equatable, CustomStringConvertib
         case sdr
         case hdr10
         case hlg
+        /// Never produced today: the engine presents Dolby Vision streams as
+        /// their base layer (or converts them to HDR10). Reserved for a real
+        /// Dolby Vision output path (PLAN.md §7, compressed `dvh1` enqueue) —
+        /// that is the point to ask the TV for Dolby Vision mode — so switches
+        /// written now stay exhaustive then.
         case dolbyVision
     }
 
@@ -50,7 +56,6 @@ public struct ContentDisplayCriteria: Sendable, Equatable, CustomStringConvertib
     let yCbCrMatrix: String?
     let masteringDisplayColorVolume: Data?
     let contentLightLevel: Data?
-    let dolbyVision: DolbyVisionConfiguration?
 
     /// Whether the two ask the TV for the same mode — the only thing that
     /// decides whether applying one after the other switches the TV again.
@@ -65,11 +70,8 @@ public struct ContentDisplayCriteria: Sendable, Equatable, CustomStringConvertib
 
     /// A video format description carrying these criteria, for
     /// `AVDisplayCriteria(refreshRate:formatDescription:)`. Colour tags come
-    /// from the enqueued frames when there are any. Dolby Vision is signalled
-    /// the way a `dvh1` sample entry signals it: that codec type plus the
-    /// configuration record's box. The codec type is `dvh1` whatever the base
-    /// layer's codec, because the description exists only to select a display
-    /// mode, and that is the type the system knows Dolby Vision by.
+    /// from the enqueued frames when there are any, so the description says
+    /// what the display is actually handed.
     public func makeFormatDescription() -> CMVideoFormatDescription? {
         var extensions: [CFString: Any] = [:]
         if let colorPrimaries { extensions[kCMFormatDescriptionExtension_ColorPrimaries] = colorPrimaries }
@@ -80,11 +82,6 @@ public struct ContentDisplayCriteria: Sendable, Equatable, CustomStringConvertib
         }
         if let contentLightLevel {
             extensions[kCMFormatDescriptionExtension_ContentLightLevelInfo] = contentLightLevel
-        }
-        if dynamicRange == .dolbyVision, let dolbyVision {
-            extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] = [
-                dolbyVision.boxType: dolbyVision.boxPayload,
-            ]
         }
         var description: CMVideoFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
@@ -237,13 +234,12 @@ extension ContentDisplayCriteria {
             width: output?.width ?? stream.width,
             height: output?.height ?? stream.height,
             basis: basis,
-            codecType: codecType(codecName: stream.codecName, range: range),
+            codecType: codecType(codecName: stream.codecName),
             colorPrimaries: tags.primaries,
             transferFunction: tags.transfer,
             yCbCrMatrix: tags.matrix,
             masteringDisplayColorVolume: output?.masteringDisplayColorVolume,
-            contentLightLevel: output?.contentLightLevel,
-            dolbyVision: range == .dolbyVision ? stream.dolbyVision : nil
+            contentLightLevel: output?.contentLightLevel
         )
     }
 
@@ -259,14 +255,19 @@ extension ContentDisplayCriteria {
         }
     }
 
-    /// Dolby Vision decides first: an IPT base layer is converted to HDR10;
-    /// any other Dolby Vision stream (8.1's HDR10 base, 8.4's HLG base, …)
-    /// keeps asking for Dolby Vision, the mode its RPU was mastered for, and
-    /// the system maps the base layer into it. Otherwise the transfer function
-    /// of what is enqueued decides, or the stream's before there is any.
+    /// The range of what is presented. Dolby Vision with an IPT base layer is
+    /// converted to HDR10, so it is HDR10 whatever its frames were tagged
+    /// before conversion. Any other Dolby Vision stream is presented as its
+    /// base layer — the engine has no Dolby Vision output, the RPU is not
+    /// applied — so it is treated like the HDR10, HLG or SDR stream it then
+    /// is: the transfer function of the enqueued frames decides, and before
+    /// there are any, the base layer's compatibility ID (more reliable than
+    /// the VUI, which DV encodes often leave unspecified), else the stream's
+    /// transfer characteristics. Asking for Dolby Vision mode belongs to a
+    /// real Dolby Vision output path (PLAN.md §7), not to this one.
     static func dynamicRange(stream: Stream, output: Output?) -> DynamicRange {
-        if let dolbyVision = stream.dolbyVision {
-            return dolbyVision.baseLayerIsIPT ? .hdr10 : .dolbyVision
+        if stream.dolbyVision?.baseLayerIsIPT == true {
+            return .hdr10
         }
         if let output {
             // An untagged frame is shown as SDR, so it is SDR.
@@ -275,12 +276,26 @@ extension ContentDisplayCriteria {
             if transfer == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String { return .hlg }
             return .sdr
         }
+        if let presented = stream.dolbyVision.flatMap(baseLayerRange) {
+            return presented
+        }
         // H.273 transfer characteristics, which FFmpeg's enum mirrors:
         // 16 is SMPTE ST 2084 (PQ), 18 is ARIB STD-B67 (HLG).
         switch stream.colorTransfer {
         case 16: return .hdr10
         case 18: return .hlg
         default: return .sdr
+        }
+    }
+
+    /// What a Dolby Vision base layer is on its own, by its signal
+    /// compatibility ID; nil for IDs that say nothing displayable.
+    private static func baseLayerRange(_ configuration: DolbyVisionConfiguration) -> DynamicRange? {
+        switch configuration.baseLayerCompatibilityID {
+        case 1, 6: .hdr10 // HDR10 (6: BT.2020 HDR10, profile 7)
+        case 4: .hlg
+        case 2: .sdr
+        default: nil
         }
     }
 
@@ -342,8 +357,7 @@ extension ContentDisplayCriteria {
     /// The sample entry type of the stream's codec. The display mode does not
     /// depend on it; a familiar type keeps the description ordinary, so an
     /// unknown codec is described as H.264.
-    static func codecType(codecName: String, range: DynamicRange) -> CMVideoCodecType {
-        if range == .dolbyVision { return kCMVideoCodecType_DolbyVisionHEVC }
+    static func codecType(codecName: String) -> CMVideoCodecType {
         switch codecName {
         case "hevc": return kCMVideoCodecType_HEVC
         case "av1": return kCMVideoCodecType_AV1

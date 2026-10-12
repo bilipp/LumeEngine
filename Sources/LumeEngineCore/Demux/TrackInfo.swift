@@ -1,5 +1,3 @@
-import Foundation
-
 /// Engine-facing description of one stream in the container.
 /// Pure value type — built once at open, never mutated.
 public struct TrackInfo: Sendable, Identifiable, Equatable {
@@ -109,34 +107,6 @@ public struct DolbyVisionConfiguration: Sendable, Equatable {
     /// layer is SDR plus an enhancement layer this engine does not decode.
     public var baseLayerIsIPT: Bool {
         baseLayerCompatibilityID == 0 && [5, 10, 20].contains(profile)
-    }
-
-    /// The ISO BMFF box the record travels in: `dvcC` up to profile 7, `dvvC`
-    /// for 8–10, `dvwC` beyond.
-    var boxType: String {
-        profile > 10 ? "dvwC" : profile > 7 ? "dvvC" : "dvcC"
-    }
-
-    /// The record serialized as that box's 24-byte payload (Dolby Vision
-    /// Streams Within the ISO Base Media File Format, §3.2).
-    var boxPayload: Data {
-        var bytes = [UInt8](repeating: 0, count: 24)
-        bytes[0] = versionMajor
-        bytes[1] = versionMinor
-        // profile(7) level(6) rpu(1) el(1) bl(1) compatibility(4) compression(2), then reserved.
-        var bits: UInt32 = 0
-        bits |= UInt32(profile & 0x7F) << 25
-        bits |= UInt32(level & 0x3F) << 19
-        bits |= (hasRPU ? 1 : 0) << 18
-        bits |= (hasEnhancementLayer ? 1 : 0) << 17
-        bits |= (hasBaseLayer ? 1 : 0) << 16
-        bits |= UInt32(baseLayerCompatibilityID & 0x0F) << 12
-        bits |= UInt32(metadataCompression & 0x03) << 10
-        bytes[2] = UInt8(truncatingIfNeeded: bits >> 24)
-        bytes[3] = UInt8(truncatingIfNeeded: bits >> 16)
-        bytes[4] = UInt8(truncatingIfNeeded: bits >> 8)
-        bytes[5] = UInt8(truncatingIfNeeded: bits)
-        return Data(bytes)
     }
 }
 

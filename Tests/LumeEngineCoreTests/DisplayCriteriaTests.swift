@@ -6,9 +6,9 @@ import Testing
 
 /// The display mode asked of the TV is what the engine outputs, not what the
 /// container says: deinterlacing doubles the rate, Dolby Vision with an IPT
-/// base layer leaves as HDR10. Getting it wrong is visible on every frame —
-/// a 50p football match judders at 25 Hz; an HDR10 picture in Dolby Vision
-/// mode, or the reverse, is mis-toned.
+/// base layer leaves as HDR10, any other Dolby Vision stream as its base
+/// layer. Getting it wrong is visible on every frame — a 50p football match
+/// judders at 25 Hz; a base layer shown in the wrong range is mis-toned.
 @Suite("ContentDisplayCriteria")
 struct ContentDisplayCriteriaTests {
     private typealias Criteria = ContentDisplayCriteria
@@ -25,10 +25,12 @@ struct ContentDisplayCriteriaTests {
         Criteria.Stream(codecName: "h264", width: 1920, height: 1080, frameRate: fps, isInterlaced: interlaced)
     }
 
-    private func dolbyVision(profile: UInt8, compatibility: UInt8) -> Criteria.Stream {
+    /// Transfer 2 (unspecified) by default: DV encodes often leave the VUI
+    /// empty, so the configuration record has to decide.
+    private func dolbyVision(profile: UInt8, compatibility: UInt8, transfer: UInt32 = 2) -> Criteria.Stream {
         Criteria.Stream(
             codecName: "hevc", width: 3840, height: 2160, frameRate: 24000.0 / 1001,
-            isInterlaced: false, colorTransfer: 16,
+            isInterlaced: false, colorTransfer: transfer,
             dolbyVision: DolbyVisionConfiguration(profile: profile, level: 6, baseLayerCompatibilityID: compatibility)
         )
     }
@@ -146,17 +148,46 @@ struct ContentDisplayCriteriaTests {
         }
     }
 
-    @Test("Dolby Vision with a displayable base layer (8.1, 8.4, 10.1) stays Dolby Vision")
-    func compatibleProfilesStayDolbyVision() {
-        #expect(resolve(dolbyVision(profile: 8, compatibility: 1)).dynamicRange == .dolbyVision)
-        #expect(resolve(dolbyVision(profile: 8, compatibility: 4)).dynamicRange == .dolbyVision)
-        #expect(resolve(dolbyVision(profile: 10, compatibility: 1)).dynamicRange == .dolbyVision)
-        // Even when its frames are tagged HDR10, which 8.1's base layer is.
+    @Test("other Dolby Vision profiles ask for the range of the base layer that is presented")
+    func compatibleProfilesAskForBaseLayer() {
+        let cases: [(profile: UInt8, compatibility: UInt8, range: Criteria.DynamicRange)] = [
+            (8, 1, .hdr10), (10, 1, .hdr10), (7, 6, .hdr10), (8, 4, .hlg), (8, 2, .sdr), (9, 2, .sdr),
+        ]
+        for (profile, compatibility, range) in cases {
+            let criteria = resolve(dolbyVision(profile: profile, compatibility: compatibility))
+            #expect(criteria.dynamicRange == range, "\(profile).\(compatibility) must ask for \(range)")
+        }
+    }
+
+    @Test("Dolby Vision is never asked for: there is no Dolby Vision output path")
+    func neverDolbyVision() {
+        for profile: UInt8 in [4, 5, 7, 8, 9, 10, 20] {
+            for compatibility: UInt8 in [0, 1, 2, 4, 6, 9] {
+                let criteria = resolve(dolbyVision(profile: profile, compatibility: compatibility))
+                #expect(criteria.dynamicRange != .dolbyVision, "\(profile).\(compatibility)")
+            }
+        }
+    }
+
+    @Test("once frames exist, their transfer function cross-checks the compatibility ID")
+    func baseLayerFramesDecide() {
         let pq = Criteria.Output(
             width: 3840, height: 2160,
             transferFunction: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String
         )
-        #expect(resolve(dolbyVision(profile: 8, compatibility: 1), output: pq).dynamicRange == .dolbyVision)
+        let hlg = Criteria.Output(
+            width: 3840, height: 2160,
+            transferFunction: kCVImageBufferTransferFunction_ITU_R_2100_HLG as String
+        )
+        #expect(resolve(dolbyVision(profile: 8, compatibility: 1), output: pq).dynamicRange == .hdr10)
+        #expect(resolve(dolbyVision(profile: 8, compatibility: 4), output: hlg).dynamicRange == .hlg)
+        // A record that disagrees with what is actually presented loses.
+        #expect(resolve(dolbyVision(profile: 8, compatibility: 1), output: hlg).dynamicRange == .hlg)
+        // An unknown compatibility ID falls back to the stream's transfer.
+        #expect(resolve(dolbyVision(profile: 8, compatibility: 9, transfer: 18)).dynamicRange == .hlg)
+        // The converted IPT profiles are HDR10 whatever their frames were tagged.
+        let untagged = Criteria.Output(width: 3840, height: 2160)
+        #expect(resolve(dolbyVision(profile: 5, compatibility: 0), output: untagged).dynamicRange == .hdr10)
     }
 
     // MARK: Format description
@@ -174,23 +205,13 @@ struct ContentDisplayCriteriaTests {
         #expect(dimensions.width == 3840 && dimensions.height == 2160)
     }
 
-    @Test("profile 8.1 is described as dvh1 with its dvvC record")
-    func dolbyVisionFormatDescription() throws {
+    @Test("profile 8.1 is described as the HDR10 HEVC it is presented as, with no Dolby Vision signalling")
+    func baseLayerFormatDescription() throws {
         let format = try #require(resolve(dolbyVision(profile: 8, compatibility: 1)).makeFormatDescription())
-        #expect(CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_DolbyVisionHEVC)
-        let atoms = CMFormatDescriptionGetExtension(
-            format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms
-        ) as? [String: Data]
-        let record = try #require(atoms?["dvvC"])
-        // Version 1.0, profile 8, level 6, RPU + base layer, compatibility 1.
-        #expect(Array(record) == [0x01, 0x00, 0x10, 0x35, 0x10] + [UInt8](repeating: 0, count: 19))
-    }
-
-    @Test("the record's box follows the profile: dvcC to 7, dvvC to 10, dvwC beyond")
-    func dolbyVisionBoxType() {
-        #expect(DolbyVisionConfiguration(profile: 7, level: 6, baseLayerCompatibilityID: 6).boxType == "dvcC")
-        #expect(DolbyVisionConfiguration(profile: 10, level: 6, baseLayerCompatibilityID: 1).boxType == "dvvC")
-        #expect(DolbyVisionConfiguration(profile: 20, level: 6, baseLayerCompatibilityID: 0).boxType == "dvwC")
+        #expect(CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC)
+        #expect(extensionString(format, kCMFormatDescriptionExtension_TransferFunction)
+            == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+        #expect(CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) == nil)
     }
 
     @Test("SDR before the first frame is described as BT.709")
