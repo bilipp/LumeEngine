@@ -591,12 +591,18 @@ public final class VideoDecoder: @unchecked Sendable {
             hardware = false // an engine-written surface, not VideoToolbox's
         }
 
+        // Here, after conversion, because no path keeps it by itself:
+        // VideoToolbox's surfaces arrive without it and the engine's own
+        // buffers carry only what is written on them (see `HDRMetadata`).
+        HDRMetadata(frame: frame).apply(to: pixelBuffer)
+
         let videoFrame = VideoFrame(
             pixelBuffer: pixelBuffer,
             pts: pts,
             duration: duration,
             serial: serial,
-            isHardwareDecoded: hardware
+            isHardwareDecoded: hardware,
+            hdr10PlusMessage: HDR10Plus.t35Message(from: frame)
         )
         // Blocking send = backpressure; closed output (teardown) just drops.
         try? output.send(videoFrame)

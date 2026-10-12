@@ -1,5 +1,6 @@
 internal import CFFmpeg
 import CoreVideo
+import Foundation
 
 /// One decoded video frame, always backed by a `CVPixelBuffer` (zero-copy from
 /// VideoToolbox, or pool-converted from software decode). Immutable after
@@ -17,13 +18,18 @@ public final class VideoFrame: @unchecked Sendable {
     /// that were hardware-decoded and then deinterlaced (CPU) or converted
     /// from Dolby Vision to HDR10 (GPU).
     public let isHardwareDecoded: Bool
+    /// The frame's HDR10+ dynamic metadata as an ITU-T T.35 message, for the
+    /// sample buffer (`HDR10Plus`). Per sample, not per pixel buffer: that is
+    /// where Apple reads it.
+    let hdr10PlusMessage: Data?
 
     init(
         pixelBuffer: CVPixelBuffer,
         pts: Int64,
         duration: Int64,
         serial: UInt64,
-        isHardwareDecoded: Bool
+        isHardwareDecoded: Bool,
+        hdr10PlusMessage: Data? = nil
     ) {
         self.pixelBuffer = pixelBuffer
         self.pts = pts
@@ -32,6 +38,7 @@ public final class VideoFrame: @unchecked Sendable {
         self.width = CVPixelBufferGetWidth(pixelBuffer)
         self.height = CVPixelBufferGetHeight(pixelBuffer)
         self.isHardwareDecoded = isHardwareDecoded
+        self.hdr10PlusMessage = hdr10PlusMessage
     }
 }
 
