@@ -121,6 +121,8 @@ public actor PlayerSession {
     private var openContinuation: CheckedContinuation<MediaInfo, Error>?
     private var pumpTasks: [Task<Void, Never>] = []
     private var monitorTask: Task<Void, Never>?
+    /// The data-plane joins of `shutdown()`, once it has started.
+    private var teardown: Task<Void, Never>?
 
     private var targetRate: Float = 1.0
     private var shouldPlay = false
@@ -522,17 +524,41 @@ public actor PlayerSession {
     // MARK: Teardown
 
     /// Stops everything. Bounded, idempotent, safe at any point of the lifecycle.
-    public func shutdown() {
+    /// Returns once every data-plane thread has been joined (or its deadline
+    /// passed) and the source is closed.
+    ///
+    /// The joins run on a thread of their own (`DedicatedThread`) while the
+    /// session awaits them: the actor stays free, and a cooperative thread is
+    /// never parked on a thread join (PLAN.md D1). The session is detached from
+    /// its source before the first suspension, so a call that interleaves
+    /// with the teardown finds nothing left to act on.
+    public func shutdown() async {
+        if let teardown {
+            await teardown.value // a concurrent caller also waits for the joins
+            return
+        }
         monitorTask?.cancel()
         monitorTask = nil
-        renderer.shutdown()
-        videoDecoder?.shutdown()
-        audioDecoder?.shutdown()
-        subtitleDecoder?.shutdown()
-        demuxer?.shutdown()
         for task in pumpTasks { task.cancel() }
         pumpTasks.removeAll()
+        // With the demux pump gone, the demuxer's `.openFailed` can no longer
+        // reach a pending `open()`; answer it here instead of leaving it hung.
+        openContinuation?.resume(throwing: EngineError(code: .cancelled, message: "session shut down while opening"))
+        openContinuation = nil
+        renderer.shutdown()
+        let stages = (video: videoDecoder, audio: audioDecoder, subtitle: subtitleDecoder, demuxer: demuxer)
+        demuxer = nil
         if state != .failed { state = .idle }
+        let teardown = Task {
+            await DedicatedThread.run(named: "engine.lume.session-teardown") {
+                stages.video?.shutdown()
+                stages.audio?.shutdown()
+                stages.subtitle?.shutdown()
+                stages.demuxer?.shutdown()
+            }
+        }
+        self.teardown = teardown
+        await teardown.value
         eventSink.finish()
     }
 
@@ -596,7 +622,7 @@ public actor PlayerSession {
         if let old = selectedAudioTrackIndex {
             demuxer?.detach(streamIndex: old)
         }
-        audioDecoder?.shutdown(deadline: 2)
+        if let retired = audioDecoder { retire { retired.shutdown(deadline: 2) } }
         audioPackets?.close()
         audioDecoder = nil
         audioPackets = nil
@@ -610,7 +636,7 @@ public actor PlayerSession {
         if let old = selectedAudioTrackIndex {
             demuxer.detach(streamIndex: old)
         }
-        audioDecoder?.shutdown(deadline: 2)
+        if let retired = audioDecoder { retire { retired.shutdown(deadline: 2) } }
         audioPackets?.close()
 
         let packets = makeAudioPacketChannel()
@@ -636,13 +662,23 @@ public actor PlayerSession {
         if let old = selectedSubtitleTrackIndex {
             demuxer?.detach(streamIndex: old)
         }
-        subtitleDecoder?.shutdown(deadline: 2)
+        if let retired = subtitleDecoder {
+            retired.requestStop() // no cue of the old track lands after `removeAll` below
+            retire { retired.shutdown(deadline: 2) }
+        }
         subtitlePackets?.close()
         subtitleDecoder = nil
         subtitlePackets = nil
         selectedSubtitleTrackIndex = nil
         usingExternalSubtitles = false
         subtitles.removeAll()
+    }
+
+    /// Joins a retired lane's decoder off the actor (see `DedicatedThread`).
+    /// The lane is already cut off from the demuxer and the renderer, so
+    /// nothing waits for its thread to exit.
+    private func retire(_ join: @escaping @Sendable () -> Void) {
+        DedicatedThread.start(named: "engine.lume.lane-teardown", join)
     }
 
     func installSubtitleLane(trackIndex: Int32, packets: Channel<Packet>, decoder: SubtitleDecoder) {

@@ -183,6 +183,15 @@ swift test --filter DecoderTests/testName      # one test
 Fixtures are generated lazily on the first run into `TestStreams/generated/`
 (gitignored, idempotent) by `Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh`.
 
+CI runs the suite with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, which gives Swift
+concurrency a single cooperative thread: anything that blocks one from async code — a
+blocking `Channel.receive` in an `async` test, a thread join on an actor — stalls or hangs
+there instead of passing on a fast machine. Run the same locally when you touch
+concurrency, and put blocking work on a thread of its own (`Support/ChannelDrain.swift`).
+
+If you edit Markdown, `python3 .github/scripts/check-docs.py` checks relative links and
+anchors offline, as CI does.
+
 **Run the suite before opening a PR**, and add tests for what you change. New work in
 `Demux/`, `Decode/`, `Time/`, or `Concurrency/` is expected to come with tests — those
 are the historically crash-prone areas and the suite is deliberately densest there:

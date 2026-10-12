@@ -126,7 +126,7 @@ LumeEngine/
 ### 4.3 Key design decisions
 
 **D1 — Data plane on dedicated threads, control plane on actors.**
-`av_read_frame`, `avcodec_receive_frame`, and audio render callbacks block or run real-time — they cannot be actor-isolated. Each stage owns one thread; stages communicate through **bounded, lock-based MPSC/SPSC channels** (small, heavily tested, no `assertionFailure` in production paths, PTS-depth accounting built in). The `PlayerSession` actor owns lifecycle, seeks, track switching, and receives events; it never touches frames.
+`av_read_frame`, `avcodec_receive_frame`, and audio render callbacks block or run real-time — they cannot be actor-isolated. Each stage owns one thread; stages communicate through **bounded, lock-based MPSC/SPSC channels** (small, heavily tested, no `assertionFailure` in production paths, PTS-depth accounting built in). The `PlayerSession` actor owns lifecycle, seeks, track switching, and receives events; it never touches frames — and it never blocks either: joining a stage's thread at teardown is a blocking wait like any other, so the actor hands it to a dedicated thread and awaits the result. CI runs the suite on a one-thread cooperative pool (`LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`) so that any blocking wait reached from async code surfaces as a hang rather than as load-dependent starvation.
 
 **D2 — RAII wrappers over FFmpeg objects.**
 `Packet`, `VideoFrame`, `AudioFrame` are final classes wrapping `AVPacket*`/`AVFrame*` with `av_*_ref` semantics, deinit-based free, and `@unchecked Sendable` justified by immutability-after-construction. CVPixelBuffers from hwaccel are retained CF objects. No `Unmanaged` outside these wrappers and the audited AVIO/interrupt bridges.

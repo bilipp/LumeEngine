@@ -53,7 +53,7 @@ Prerequisites:
   ```
 - Tests need a host `ffmpeg` CLI (Homebrew) — fixtures are generated lazily on first test run by `Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh` into `TestStreams/generated/` (gitignored, idempotent). `Fixtures.swift` finds Homebrew ffmpeg automatically; override with the `FFMPEG` env var.
 
-CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test`, then cross-compiles the library for iOS and tvOS via `xcodebuild` (compile-only, one cached slice each — visionOS is left to local verification because that matrix entry was never confirmed on a runner — the xrOS SDK ships with Xcode, but a visionOS *destination* also needs Xcode's visionOS platform component); tagged releases build all 10 platform slices and attach the xcframework.
+CI (`.github/workflows/ci.yml`) builds the macOS FFmpeg slice (cached on `build/versions.json` + scripts + patches hashes) and runs `swift test` with a strict one-thread cooperative pool (see above), checks the Markdown docs offline (`.github/scripts/check-docs.py`: relative links and in-repo anchors resolve, `CLAUDE.md` is still the `AGENTS.md` symlink — run it after editing docs), then cross-compiles the library for iOS and tvOS via `xcodebuild` (compile-only, one cached slice each — visionOS is left to local verification because that matrix entry was never confirmed on a runner — the xrOS SDK ships with Xcode, but a visionOS *destination* also needs Xcode's visionOS platform component); tagged releases build all 10 platform slices and attach the xcframework.
 
 ## Architecture
 
@@ -70,6 +70,7 @@ This split is the core invariant of the codebase:
 
 - **Control plane = actors.** `PlayerSession` (actor, `Session/`) owns lifecycle, seek, track switching, and event emission. It never touches frames.
 - **Data plane = dedicated threads.** Blocking FFmpeg calls (`av_read_frame`, `avcodec_receive_frame`) run on their own threads: `Demuxer` → `VideoDecoder`/`AudioDecoder`/`SubtitleDecoder` → `SystemRenderer`. Stages communicate only through `Concurrency/Channel` — a bounded, blocking, PTS-accounted channel that provides backpressure (producers park when full) and wakeable teardown. Never put a blocking FFmpeg call on an actor; never bypass channels between stages.
+- **Actors and async code never block.** That includes waiting for a stage: every `shutdown(deadline:)` joins a thread, so the control plane hands joins to `Concurrency/DedicatedThread` and awaits them (session teardown) or doesn't wait at all (a retired track lane). The same goes for tests — a blocking `Channel.receive` belongs on a thread of its own (`Support/ChannelDrain.swift`, `DedicatedThread.run`), not in an `async` test body. CI enforces this by running the suite with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` (a one-thread cooperative pool), where a blocking wait that only starved the pool before stalls or hangs the run instead; run `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 swift test` locally when touching concurrency.
 - **The main thread is never on the data path.** UI state is a decoupled low-rate observation.
 
 ### Key invariants (from PLAN.md §3 — requirements, not style preferences)

@@ -43,8 +43,34 @@ jobs:
       - name: Package xcframework
         run: build/scripts/make-xcframework.sh
 
+      # Up front rather than lazily from the first test that needs one: the
+      # lazy path waits for the ffmpeg child process on a cooperative thread,
+      # which the strict pool below would turn into the whole suite stalling
+      # behind it. Idempotent, so the tests' own call is then a no-op.
+      - name: Generate test fixtures
+        run: bash Tests/LumeEngineCoreTests/Fixtures/generate-fixtures.sh TestStreams/generated
+
       - name: Run tests
+        # One cooperative thread for all of Swift concurrency. Code that blocks
+        # a cooperative thread — a blocking Channel.receive, a semaphore or
+        # condition wait, a thread join reached from an actor or an async test —
+        # then hangs or stalls the run here, instead of only starving the pool
+        # on a loaded machine (PLAN.md D1; see DedicatedThread and ChannelDrain).
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: '1'
         run: swift test
+
+  # Offline documentation check: relative links and in-repo anchors in every
+  # tracked Markdown file resolve, and CLAUDE.md is still the AGENTS.md
+  # symlink. No network, no dependencies beyond the runner's python3.
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Markdown links and anchors
+        run: python3 .github/scripts/check-docs.py
 
   # Cross-compile the library products for the shipping platforms. `swift test` above
   # only proves macOS: platform-conditional code (VideoToolbox paths, PiP, audio session)
