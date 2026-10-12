@@ -1,8 +1,14 @@
 import Foundation
 import Synchronization
 
-/// One subtitle cue on the engine timeline. Text-only for now; bitmap cues
-/// (PGS/DVB) and full libass styling land with the subtitle pack (PLAN.md P5+).
+/// One subtitle cue on the engine timeline: text, bitmaps, or (rarely) both.
+/// Full libass styling lands with the subtitle pack (PLAN.md P5+).
+///
+/// Bitmap formats (DVB, PGS, DVD) arrive as `images` with empty `text`, so a
+/// consumer that only reads `text` shows nothing for them rather than
+/// something wrong. Drawing them is the host's job: `LumePlayerView` is bare
+/// video. Draw each image at its `rect` scaled to the video's display area,
+/// above the video.
 public struct SubtitleCue: Sendable, Equatable, Identifiable {
     public let id: UInt64
     /// Engine µs.
@@ -10,12 +16,19 @@ public struct SubtitleCue: Sendable, Equatable, Identifiable {
     public let end: Int64
     /// Plain display text (override tags stripped, line breaks preserved).
     public let text: String
+    /// Bitmaps to draw over the video, positioned relative to it.
+    public let images: [SubtitleImage]
 
-    public init(id: UInt64, start: Int64, end: Int64, text: String) {
+    public init(id: UInt64, start: Int64, end: Int64, text: String, images: [SubtitleImage] = []) {
         self.id = id
         self.start = start
         self.end = end
         self.text = text
+        self.images = images
+    }
+
+    func ending(at time: Int64) -> SubtitleCue {
+        SubtitleCue(id: id, start: start, end: time, text: text, images: images)
     }
 }
 
