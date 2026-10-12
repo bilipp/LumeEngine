@@ -41,7 +41,11 @@ swift test                                    # full suite
 swift test --filter TimestampUnwrapperTests   # one suite
 swift test --filter DecoderTests/testName     # one test
 swift run LumeEngineDemo                      # macOS demo app with diagnostics HUD
+swift run lumectl probe <url>                 # tracks, codecs, live/seekable, HDR tags
+swift run lumectl play <url> --duration 60    # headless run: events, heartbeat, startup, exit status
 ```
+
+`lumectl` reproduces a provider issue without the app: it drives a `PlayerSession` headlessly (muted) and prints what the engine reports — typed events, the `Diagnostics` heartbeat with the delivery rate, the `StartupTimeline`, `lastStallReason` on every stall, the `EngineError` (with its HTTP class) on failure. Exit status: 0 ok, 3 open failed, 4 playback failed, 5 stalled. URLs are redacted to scheme and host unless `--show-urls`, since IPTV URLs carry credentials — keep it that way. Its logic lives in `Sources/LumeCtlCore` (tested from `LumeCtlTests.swift`); `lumectl --help` lists the options. When a Lume report arrives, a `lumectl play` run against the same URL (with `--json` or `--record-events run.jsonl`) is usually the quickest way to tell an engine problem from a provider one.
 
 Prerequisites:
 - `BinaryDependencies/FFmpeg.xcframework` must exist before anything compiles. Build it once (or after bumping `build/versions.json`):

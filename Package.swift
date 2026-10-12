@@ -85,6 +85,9 @@ let package = Package(
         // namespace), so apps can also link engines embedding other FFmpeg builds
         // without symbol collisions.
         .library(name: "LumeEngine", type: .dynamic, targets: ["LumeEngine"]),
+        // macOS triage tool: `swift run lumectl --help`. Drives a session
+        // headlessly against a URL; nothing a consumer app links.
+        .executable(name: "lumectl", targets: ["lumectl"]),
     ],
     targets: [
         // FFmpeg 9.0.x static libraries: released artifact, or a local build when
@@ -116,11 +119,24 @@ let package = Package(
             path: "DemoApp/Sources"
         ),
 
+        // lumectl's logic (argument parsing, URL redaction, the headless run,
+        // output), kept out of the executable so the tests can reach it.
+        .target(
+            name: "LumeCtlCore",
+            dependencies: ["LumeEngineCore"]
+        ),
+        .executableTarget(
+            name: "lumectl",
+            dependencies: ["LumeCtlCore"]
+        ),
+
         .testTarget(
             name: "LumeEngineCoreTests",
             // CFFmpeg directly: some tests build FFmpeg structs (e.g. Dolby
             // Vision metadata) to exercise the engine's readers of them.
-            dependencies: ["LumeEngineCore", "LumeEngine", "CFFmpeg"],
+            // LumeCtlCore and lumectl: the tool's tests reuse the fixtures and
+            // the torture server, and the Ctrl-C test runs the built binary.
+            dependencies: ["LumeEngineCore", "LumeEngine", "CFFmpeg", "LumeCtlCore", "lumectl"],
             exclude: ["Fixtures/generate-fixtures.sh"]
         ),
     ],

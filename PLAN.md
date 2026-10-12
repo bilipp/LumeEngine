@@ -116,7 +116,8 @@ LumeEngine/
 │   ├── LumeEngineRender/       # SystemRenderer, MetalRenderer, shaders
 │   ├── LumeEngineSubtitles/    # libass bridge, parsers, cue model, styling
 │   ├── LumeEngineMedia/        # Now Playing, PiP, audio session, route handling
-│   └── LumeEngine/             # public facade: LumePlayer, LumePlayerView, config, events
+│   ├── LumeEngine/             # public facade: LumePlayer, LumePlayerView, config, events
+│   └── LumeCtlCore/, lumectl/  # macOS triage CLI: headless session against a URL, events + diagnostics
 ├── BinaryDependencies/         # generated Package targets for ffmpeg/libass/dav1d xcframeworks
 ├── build/                      # FFmpeg build pipeline (scripts, patches, configs)
 ├── DemoApp/                    # multiplatform SwiftUI demo (streams menu, diagnostics HUD)
