@@ -21,6 +21,13 @@ public struct TrackInfo: Sendable, Identifiable, Equatable {
         public let colorTransfer: UInt32
         public let colorSpace: UInt32
         public let colorRangeFull: Bool
+        /// Whether the stream is coded interlaced, from the field order the
+        /// container or codec reports; nil when it reports none. A prediction
+        /// only: whether frames really come out interlaced is decided per
+        /// frame (`VideoDecoder.isDeinterlacing`).
+        public let isInterlaced: Bool?
+        /// The stream's Dolby Vision configuration record; nil when it has none.
+        public let dolbyVision: DolbyVisionConfiguration?
     }
 
     public struct Audio: Sendable, Equatable {
@@ -55,6 +62,53 @@ public struct TrackInfo: Sendable, Identifiable, Equatable {
     /// streams. Such tracks are listed but never chosen automatically;
     /// selecting one explicitly ends in a `.decoderInitFailed` error.
     public internal(set) var isDecodable = true
+}
+
+/// A Dolby Vision decoder configuration record (`dvcC`/`dvvC`/`dvwC`), as the
+/// container or the stream's descriptor carries it.
+public struct DolbyVisionConfiguration: Sendable, Equatable {
+    public let versionMajor: UInt8
+    public let versionMinor: UInt8
+    public let profile: UInt8
+    public let level: UInt8
+    public let hasRPU: Bool
+    public let hasEnhancementLayer: Bool
+    public let hasBaseLayer: Bool
+    /// What the base layer is on its own: 0 none (IPTPQc2), 1 HDR10, 2 SDR,
+    /// 4 HLG, 6 BT.2020 HDR10.
+    public let baseLayerCompatibilityID: UInt8
+    public let metadataCompression: UInt8
+
+    public init(
+        versionMajor: UInt8 = 1,
+        versionMinor: UInt8 = 0,
+        profile: UInt8,
+        level: UInt8,
+        hasRPU: Bool = true,
+        hasEnhancementLayer: Bool = false,
+        hasBaseLayer: Bool = true,
+        baseLayerCompatibilityID: UInt8,
+        metadataCompression: UInt8 = 0
+    ) {
+        self.versionMajor = versionMajor
+        self.versionMinor = versionMinor
+        self.profile = profile
+        self.level = level
+        self.hasRPU = hasRPU
+        self.hasEnhancementLayer = hasEnhancementLayer
+        self.hasBaseLayer = hasBaseLayer
+        self.baseLayerCompatibilityID = baseLayerCompatibilityID
+        self.metadataCompression = metadataCompression
+    }
+
+    /// The record claims an IPTPQc2 base layer rather than a displayable
+    /// fallback (HDR10, SDR, HLG): profiles 5, 10.0 and 20. Records lie
+    /// (remuxes label HDR10 as profile 5), so the engine decides per frame
+    /// whether to convert to HDR10 (`DolbyVisionDetection`); this is the
+    /// stream-level claim.
+    public var baseLayerIsIPT: Bool {
+        DolbyVisionDetection.Record(self).claimsIPT
+    }
 }
 
 /// A chapter marker, in engine microseconds.

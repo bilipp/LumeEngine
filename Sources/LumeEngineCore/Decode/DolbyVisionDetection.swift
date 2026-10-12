@@ -92,15 +92,12 @@ extension DolbyVisionDetection.Record {
     /// The stream's configuration record (`dvcC`/`dvvC`, the Matroska block
     /// addition mapping, or a TS descriptor), if it has one.
     init?(_ parameters: UnsafePointer<AVCodecParameters>) {
-        guard let sideData = av_packet_side_data_get(
-            parameters.pointee.coded_side_data,
-            parameters.pointee.nb_coded_side_data,
-            AV_PKT_DATA_DOVI_CONF
-        ), let bytes = sideData.pointee.data,
-           sideData.pointee.size >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
-        else { return nil }
-        let record = UnsafeRawPointer(bytes).loadUnaligned(as: AVDOVIDecoderConfigurationRecord.self)
-        self.init(profile: record.dv_profile, compatibilityID: record.dv_bl_signal_compatibility_id)
+        guard let configuration = DolbyVisionConfiguration(parameters: parameters) else { return nil }
+        self.init(configuration)
+    }
+
+    init(_ configuration: DolbyVisionConfiguration) {
+        self.init(profile: configuration.profile, compatibilityID: configuration.baseLayerCompatibilityID)
     }
 }
 

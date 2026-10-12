@@ -37,6 +37,11 @@ public final class SystemRenderer: @unchecked Sendable {
     /// by a flush): startup diagnostics.
     private var firstVideoEnqueue: TimeInterval?
     private var firstAudioEnqueue: TimeInterval?
+    /// What the display is actually being handed — format and cadence of the
+    /// enqueued frames, after deinterlacing and Dolby Vision conversion. Read
+    /// for the display criteria (`PlayerSession.displayCriteria`).
+    private var videoCadence = FrameCadence()
+    private var lastVideoFormat: CMVideoFormatDescription?
     private var videoPumpScheduled = false
     private var audioPumpScheduled = false
     private var stopped = false
@@ -312,6 +317,7 @@ public final class SystemRenderer: @unchecked Sendable {
         lastEnqueuedAudioPTS = MediaTime.noTimestamp
         firstEnqueuedVideoPTS = MediaTime.noTimestamp
         firstEnqueuedAudioPTS = MediaTime.noTimestamp
+        videoCadence.restart()
         lock.unlock()
 
         videoRenderer.flush()
@@ -343,6 +349,15 @@ public final class SystemRenderer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return (firstVideoEnqueue, firstAudioEnqueue)
+    }
+
+    /// Format of the most recently enqueued video frame and the measured
+    /// interval between frames (engine µs; nil until enough were seen). Nil
+    /// before the first frame.
+    var videoOutput: (format: CMVideoFormatDescription, frameInterval: Double?)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastVideoFormat.map { ($0, videoCadence.interval) }
     }
 
     /// Raw renderer health for diagnostics (status is
@@ -402,6 +417,8 @@ public final class SystemRenderer: @unchecked Sendable {
                 lastEnqueuedVideoPTS = frame.pts
                 if !MediaTime.isValid(firstEnqueuedVideoPTS) { firstEnqueuedVideoPTS = frame.pts }
                 if firstVideoEnqueue == nil { firstVideoEnqueue = ProcessInfo.processInfo.systemUptime }
+                videoCadence.observe(pts: frame.pts)
+                lastVideoFormat = videoFormatCache
                 lock.unlock()
             } catch {
                 continue // malformed frame: drop, keep the pump alive

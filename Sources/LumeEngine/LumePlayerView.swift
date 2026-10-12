@@ -18,12 +18,29 @@ public struct LumePlayerView: View {
     }
 
     public var body: some View {
-        if let layer = player.displayLayer {
-            LayerHostView(layer: layer, gravity: gravity)
+        ZStack {
+            if let layer = player.displayLayer {
+                #if os(tvOS)
+                LayerHostView(
+                    layer: layer,
+                    gravity: gravity,
+                    displayMatcher: player.matchesDisplayCriteria ? player.displayMatcher : nil
+                )
                 .accessibilityLabel("Video")
-        } else {
-            Color.black
+                #else
+                LayerHostView(layer: layer, gravity: gravity)
+                    .accessibilityLabel("Video")
+                #endif
+            } else {
+                Color.black
+            }
         }
+        #if os(tvOS)
+        // The whole view, not the layer host: that one is swapped out while
+        // the player moves to the next stream, which must not hand the
+        // display back in between.
+        .onDisappear { [player] in player.displayMatcher.reset() }
+        #endif
     }
 }
 
@@ -33,20 +50,48 @@ import UIKit
 private struct LayerHostView: UIViewRepresentable {
     let layer: LumeDisplayLayer
     let gravity: AVLayerVideoGravity
+    #if os(tvOS)
+    /// Given this view's window, so it knows which display to match.
+    var displayMatcher: DisplayCriteriaMatcher?
+    #endif
 
     func makeUIView(context: Context) -> LayerHostUIView {
         let view = LayerHostUIView()
         view.install(layer: layer, gravity: gravity)
+        #if os(tvOS)
+        view.displayMatcher = displayMatcher
+        #endif
         return view
     }
 
     func updateUIView(_ view: LayerHostUIView, context: Context) {
         view.install(layer: layer, gravity: gravity)
+        #if os(tvOS)
+        view.displayMatcher = displayMatcher
+        #endif
     }
 }
 
 final class LayerHostUIView: UIView {
     private weak var hosted: LumeDisplayLayer?
+
+    #if os(tvOS)
+    weak var displayMatcher: DisplayCriteriaMatcher? {
+        didSet { lendWindow() }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        lendWindow()
+    }
+
+    /// Only ever sets a window: leaving one is not the end of playback (the
+    /// host is swapped while the next stream loads); the player view's
+    /// disappearance is.
+    private func lendWindow() {
+        if let window { displayMatcher?.window = window }
+    }
+    #endif
 
     func install(layer: LumeDisplayLayer, gravity: AVLayerVideoGravity) {
         layer.videoGravity = gravity

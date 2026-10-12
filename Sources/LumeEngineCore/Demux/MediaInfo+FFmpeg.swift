@@ -62,6 +62,33 @@ extension MediaInfo {
     }
 }
 
+extension DolbyVisionConfiguration {
+    /// The configuration record FFmpeg filed with the stream
+    /// (`AV_PKT_DATA_DOVI_CONF`, from `dvcC`/`dvvC`/`dvwC` or the MPEG-TS
+    /// descriptor); nil when there is none.
+    init?(parameters: UnsafePointer<AVCodecParameters>) {
+        guard let sideData = av_packet_side_data_get(
+            parameters.pointee.coded_side_data,
+            parameters.pointee.nb_coded_side_data,
+            AV_PKT_DATA_DOVI_CONF
+        ), let bytes = sideData.pointee.data,
+           sideData.pointee.size >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+        else { return nil }
+        let record = UnsafeRawPointer(bytes).loadUnaligned(as: AVDOVIDecoderConfigurationRecord.self)
+        self.init(
+            versionMajor: record.dv_version_major,
+            versionMinor: record.dv_version_minor,
+            profile: record.dv_profile,
+            level: record.dv_level,
+            hasRPU: record.rpu_present_flag != 0,
+            hasEnhancementLayer: record.el_present_flag != 0,
+            hasBaseLayer: record.bl_present_flag != 0,
+            baseLayerCompatibilityID: record.dv_bl_signal_compatibility_id,
+            metadataCompression: record.dv_md_compression
+        )
+    }
+}
+
 extension TrackInfo {
     init(stream: UnsafeMutablePointer<AVStream>, context: UnsafeMutablePointer<AVFormatContext>) {
         let st = stream.pointee
@@ -143,7 +170,9 @@ extension TrackInfo {
                 colorPrimaries: par.color_primaries.rawValue,
                 colorTransfer: par.color_trc.rawValue,
                 colorSpace: par.color_space.rawValue,
-                colorRangeFull: par.color_range == AVCOL_RANGE_JPEG
+                colorRangeFull: par.color_range == AVCOL_RANGE_JPEG,
+                isInterlaced: Self.isInterlaced(par.field_order),
+                dolbyVision: DolbyVisionConfiguration(parameters: st.codecpar)
             )
         } else {
             video = nil
@@ -156,6 +185,14 @@ extension TrackInfo {
             )
         } else {
             audio = nil
+        }
+    }
+
+    private static func isInterlaced(_ fieldOrder: AVFieldOrder) -> Bool? {
+        switch fieldOrder {
+        case AV_FIELD_UNKNOWN: nil
+        case AV_FIELD_PROGRESSIVE: false
+        default: true
         }
     }
 }
