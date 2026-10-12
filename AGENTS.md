@@ -85,6 +85,7 @@ This split is the core invariant of the codebase:
 - **Zero global mutable state:** all configuration is `PlayerConfiguration` passed at session creation. No `static var` knobs.
 - **No force unwraps / `as!` / `fatalError` in engine paths**; failures return typed `EngineError`. No `assertionFailure` in production channel/data paths — misuse degrades, never crashes.
 - **Never scrape FFmpeg log strings for control flow** (`av_log` is diagnostics only). Silence is never a failure mode: pipelines are supervised, stalls are detected from playhead ground truth, and failures surface as typed `PlayerEvent`s on the session's `AsyncStream`.
+- **Source URLs are credentials; nothing public carries one whole.** IPTV URLs hold the account (Xtream `/live/<user>/<pass>/…` paths, `token`/`password` queries, userinfo), FFmpeg names playlist, segment and key URLs in its warnings, and the bridged log is public so sysdiagnoses stay useful. Text bound for `os_log` or an `EngineError` message goes through `Errors/LogRedaction` (scheme, host, port and file extension survive; path, query and userinfo do not).
 - Swift 6 strict concurrency (`swiftLanguageModes: [.v6]`) — keep it honest, don't suppress diagnostics.
 
 ### Tests
