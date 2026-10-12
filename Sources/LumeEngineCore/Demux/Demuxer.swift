@@ -56,6 +56,10 @@ public final class Demuxer: @unchecked Sendable {
     // Reader-thread-only state (never touched off-thread).
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var normalizers: [Int32: StreamTimeNormalizer] = [:]
+    /// Folds encoder restarts and chunk seams out of the timeline (see
+    /// `TimelineFolder`); continuous streams are the ones that detect them.
+    private var folder = TimelineFolder()
+    private var continuousStreams: Set<Int32> = []
     private var timeBases: [Int32: AVRational] = [:]
     private var serial: UInt64 = 0
     private var atEOF = false
@@ -67,6 +71,8 @@ public final class Demuxer: @unchecked Sendable {
     private var lastPTSByStream: [Int32: Int64] = [:]
     // Guarded by `lock`: total compressed payload read (delivery-rate diagnostics).
     private var bytesDelivered: Int64 = 0
+    // Guarded by `lock`: timeline seams folded since open (diagnostics).
+    private var seamsFolded = 0
 
     /// Total compressed bytes demuxed so far — diff over time for the
     /// effective network delivery rate.
@@ -74,6 +80,14 @@ public final class Demuxer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return bytesDelivered
+    }
+
+    /// Timestamp discontinuities folded out of the timeline since open
+    /// (encoder restarts, chunk seams) — see `TimelineFolder`.
+    public var timelineSeams: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return seamsFolded
     }
 
     /// Consecutive `av_read_frame` failures tolerated before declaring the
@@ -322,6 +336,11 @@ public final class Demuxer: @unchecked Sendable {
                 normalizers[index] = StreamTimeNormalizer(wrapBits: stream.pointee.pts_wrap_bits)
                 if let params = stream.pointee.codecpar {
                     snapshots[index] = CodecParameters(copying: params)
+                    let type = params.pointee.codec_type
+                    let coverArt = stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC != 0
+                    if type == AVMEDIA_TYPE_AUDIO || (type == AVMEDIA_TYPE_VIDEO && !coverArt) {
+                        continuousStreams.insert(index)
+                    }
                 }
                 stream.pointee.discard = AVDISCARD_ALL
             }
@@ -360,6 +379,7 @@ public final class Demuxer: @unchecked Sendable {
         for key in normalizers.keys {
             normalizers[key]?.discontinuity()
         }
+        folder.reset()
         lastPTSByStream.removeAll()
         consecutiveErrors = 0
         eventSink.yield(.didSeek(to: target, serial: serial))
@@ -411,9 +431,29 @@ public final class Demuxer: @unchecked Sendable {
         let (unwrappedPts, unwrappedDts) = normalizers[streamIndex, default: StreamTimeNormalizer(wrapBits: 0)]
             .normalize(pts: rawPacket.pointee.pts, dts: rawPacket.pointee.dts)
 
-        let pts = MediaTime.fromStream(unwrappedPts, timeBase: timeBase)
-        let dts = MediaTime.fromStream(unwrappedDts, timeBase: timeBase)
+        var pts = MediaTime.fromStream(unwrappedPts, timeBase: timeBase)
+        var dts = MediaTime.fromStream(unwrappedDts, timeBase: timeBase)
         var duration = MediaTime.fromStream(rawPacket.pointee.duration, timeBase: timeBase)
+
+        // Fold encoder restarts and chunk seams out of the timeline. The
+        // folder sees every packet of every attached stream, so a seam is
+        // corrected on all of them alike.
+        let seamsBefore = folder.seamCount
+        let correction = folder.correction(
+            stream: streamIndex,
+            continuous: continuousStreams.contains(streamIndex),
+            time: MediaTime.isValid(dts) ? dts : pts,
+            duration: duration
+        )
+        if correction != 0 {
+            if MediaTime.isValid(pts) { pts += correction }
+            if MediaTime.isValid(dts) { dts += correction }
+        }
+        if folder.seamCount != seamsBefore {
+            lock.lock()
+            seamsFolded += folder.seamCount - seamsBefore
+            lock.unlock()
+        }
 
         // Containers routinely omit packet durations (matroska TrueHD tracks
         // without a default duration). All duration-budgeted accounting

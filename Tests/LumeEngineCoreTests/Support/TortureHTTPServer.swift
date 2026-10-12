@@ -9,6 +9,18 @@ final class TortureHTTPServer: @unchecked Sendable {
         case file(URL)
         /// Reject every request with 403 (expired IPTV token).
         case forbidden
+        /// Reject every request with this HTTP status.
+        case status(Int)
+        /// Serve the file the way many live channels arrive: chunked transfer
+        /// encoding, no Content-Length — and then the terminating chunk once
+        /// the file is out, the source ending. FFmpeg cannot tell that from a
+        /// lost connection (a body of unknown length always ends
+        /// "prematurely") and reports an I/O error.
+        case unbounded(file: URL)
+        /// Serve an HLS directory (`index.m3u8` + segments) as a live channel
+        /// that ends: the first playlist request gets the playlist without its
+        /// `#EXT-X-ENDLIST`, every later one with it. Use `hlsURL`.
+        case hlsLiveThenEnded(directory: URL)
         /// Send headers + the first `prefix` bytes of the file, then go silent
         /// (connection stays open — the classic dead-provider stall).
         case stallAfter(prefix: Int, file: URL)
@@ -75,6 +87,10 @@ final class TortureHTTPServer: @unchecked Sendable {
     }
 
     var url: String { "http://127.0.0.1:\(port)/stream.ts" }
+    var hlsURL: String { "http://127.0.0.1:\(port)/index.m3u8" }
+
+    /// Playlist requests served so far (HLS mode). Guarded by `lock`.
+    private var playlistRequests = 0
 
     func stop() {
         listener.cancel()
@@ -91,33 +107,73 @@ final class TortureHTTPServer: @unchecked Sendable {
         lock.unlock()
 
         connection.start(queue: queue)
-        readRequest(connection) { [weak self] in
-            self?.respond(on: connection)
+        readRequest(connection, received: Data()) { [weak self] path in
+            self?.respond(on: connection, path: path)
         }
     }
 
-    private func readRequest(_ connection: NWConnection, completion: @escaping @Sendable () -> Void) {
+    /// Reads the request head and hands over its path.
+    private func readRequest(_ connection: NWConnection, received: Data, completion: @escaping @Sendable (String) -> Void) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, _, error in
             guard error == nil, let data, !data.isEmpty else { return }
-            if data.range(of: Data("\r\n\r\n".utf8)) != nil {
-                completion()
+            let head = received + data
+            if head.range(of: Data("\r\n\r\n".utf8)) != nil {
+                let requestLine = String(decoding: head.prefix { $0 != 0x0D }, as: UTF8.self)
+                let parts = requestLine.split(separator: " ")
+                completion(parts.count > 1 ? String(parts[1]) : "/")
             } else {
-                self?.readRequest(connection, completion: completion)
+                self?.readRequest(connection, received: head, completion: completion)
             }
         }
     }
 
-    private func respond(on connection: NWConnection) {
+    private func respond(on connection: NWConnection, path: String) {
         switch mode {
         case .forbidden:
-            let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+            reject(connection, status: 403)
+
+        case .status(let status):
+            reject(connection, status: status)
+
+        case .unbounded(let url):
+            guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
+            var body = Data("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".utf8)
+            var offset = 0
+            while offset < payload.count {
+                let chunk = payload[offset..<min(offset + 64 * 1024, payload.count)]
+                body += Data("\(String(chunk.count, radix: 16))\r\n".utf8) + chunk + Data("\r\n".utf8)
+                offset += chunk.count
+            }
+            body += Data("0\r\n\r\n".utf8)
+            connection.send(content: body, completion: .contentProcessed { _ in
                 connection.cancel()
             })
 
         case .file(let url):
             guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
             send(payload: payload, on: connection, closeWhenDone: true)
+
+        case .hlsLiveThenEnded(let directory):
+            let name = path.split(separator: "/").last.map(String.init) ?? ""
+            guard let payload = try? Data(contentsOf: directory.appendingPathComponent(name)) else {
+                return reject(connection, status: 404)
+            }
+            guard name.hasSuffix(".m3u8") else {
+                return send(payload: payload, on: connection, closeWhenDone: true)
+            }
+            lock.lock()
+            playlistRequests += 1
+            let first = playlistRequests == 1
+            lock.unlock()
+            var playlist = String(decoding: payload, as: UTF8.self)
+            if first {
+                playlist = playlist.replacingOccurrences(of: "#EXT-X-ENDLIST\n", with: "")
+            }
+            let body = Data(playlist.utf8)
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+            connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
 
         case .stallAfter(let prefix, let url):
             guard let payload = try? Data(contentsOf: url) else { return connection.cancel() }
@@ -182,6 +238,13 @@ final class TortureHTTPServer: @unchecked Sendable {
             self.queue.asyncAfter(deadline: due) {
                 self.sendPaced(payload: payload, offset: end, chunk: chunk, interval: interval, start: start, index: next, on: connection)
             }
+        })
+    }
+
+    private func reject(_ connection: NWConnection, status: Int) {
+        let response = "HTTP/1.1 \(status) Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+            connection.cancel()
         })
     }
 

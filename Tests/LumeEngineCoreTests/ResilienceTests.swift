@@ -135,9 +135,118 @@ struct ResilienceTests {
             Issue.record("open should have thrown")
         } catch {
             #expect((error as? EngineError)?.code == .openFailed)
+            #expect((error as? EngineError)?.httpFailure == .forbidden)
         }
         #expect(Date().timeIntervalSince(start) < 15, "403 must fail promptly")
         #expect(await session.state == .failed)
+        await session.shutdown()
+    }
+
+    @Test(
+        "HTTP refusals are classified by status, not message",
+        .timeLimit(.minutes(1)),
+        arguments: [
+            (400, EngineError.HTTPFailure.badRequest),
+            (401, .unauthorized),
+            (404, .notFound),
+            (410, .otherClientError),
+            (429, .tooManyRequests),
+            (503, .serverError),
+            (509, .serverError),
+        ]
+    )
+    func httpStatusMatrix(status: Int, expected: EngineError.HTTPFailure) async throws {
+        let server = try TortureHTTPServer(mode: .status(status))
+        defer { server.stop() }
+
+        let session = PlayerSession(configuration: makeConfiguration())
+        do {
+            _ = try await session.open(url: server.url)
+            Issue.record("open should have thrown for HTTP \(status)")
+        } catch {
+            let engineError = error as? EngineError
+            #expect(engineError?.code == .openFailed)
+            #expect(engineError?.httpFailure == expected, "HTTP \(status): \(String(describing: engineError))")
+        }
+        await session.shutdown()
+    }
+
+    @Test("a live HLS channel that ends fails the session instead of ending it", .timeLimit(.minutes(1)))
+    func liveSourceEnded() async throws {
+        // The first playlist has no end marker, so the channel opens live (no
+        // duration); every refresh carries one. FFmpeg's HLS demuxer then
+        // plays the remaining segments and reports a clean end of file.
+        let directory = try Fixtures.url("hls-live/index.m3u8").deletingLastPathComponent()
+        let server = try TortureHTTPServer(mode: .hlsLiveThenEnded(directory: directory))
+        defer { server.stop() }
+
+        let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 30))
+        let info = try await session.open(url: server.hlsURL)
+        #expect(info.isLive, "a playlist without an end marker must open as live")
+
+        let errors = LockedBox<[EngineError]>([])
+        let eventTask = Task {
+            for await event in session.events {
+                if case .error(let error) = event { errors.set(errors.get() + [error]) }
+            }
+        }
+        defer { eventTask.cancel() }
+
+        await session.play()
+        let failed = await eventually(timeout: 30) { await session.state == .failed }
+        let finalState = await session.state
+        #expect(failed, "a live source reaching its end must fail the session, state is \(finalState)")
+        // The error event trails the state change; give the stream a moment.
+        let reported = await eventually(timeout: 5) { errors.get().contains { $0.code == .sourceEnded } }
+        #expect(reported, "errors: \(errors.get())")
+        // Everything that arrived was played before the session gave up: the
+        // live join starts three segments from the end, 6 s of media.
+        #expect(await session.position > 4, "buffered media must play out before failing")
+        await session.shutdown()
+    }
+
+    @Test("a length-less live HTTP body that ends fails the session", .timeLimit(.minutes(1)))
+    func liveHTTPBodyEnded() async throws {
+        // FFmpeg reports the end of a body of unknown length as an I/O error,
+        // so this reaches the session as a demuxer failure. Pinned here so a
+        // change in that behaviour cannot quietly turn live ends into .ended.
+        let server = try TortureHTTPServer(mode: .unbounded(file: Fixtures.url("wrap.ts")))
+        defer { server.stop() }
+
+        let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 30))
+        let info = try await session.open(url: server.url)
+        #expect(info.isLive)
+        await session.play()
+        let settled = await eventually(timeout: 30) {
+            let state = await session.state
+            return state == .failed || state == .ended
+        }
+        #expect(settled)
+        #expect(await session.state == .failed)
+        await session.shutdown()
+    }
+
+    @Test("catch-up chunks that restart their timestamps play straight through", .timeLimit(.minutes(1)))
+    func catchUpChunks() async throws {
+        let session = PlayerSession(configuration: makeConfiguration(stallThreshold: 4))
+        _ = try await session.open(url: try Fixtures.path("catchup.ts"))
+
+        let stalled = LockedBox<Bool>(false)
+        let eventTask = Task {
+            for await event in session.events {
+                if case .stalled = event { stalled.set(true) }
+            }
+        }
+        defer { eventTask.cancel() }
+
+        await session.play()
+        // The seam sits 6 s in; a clock that froze or jumped there would never
+        // get past it at real time.
+        let crossed = await eventually(timeout: 20) { await session.position > 8 }
+        let position = await session.position
+        #expect(crossed, "playback must continue past the chunk seam, reached \(position)")
+        #expect(!stalled.get(), "the seam must not stall playback")
+        #expect(await session.diagnostics.timelineSeams >= 1)
         await session.shutdown()
     }
 

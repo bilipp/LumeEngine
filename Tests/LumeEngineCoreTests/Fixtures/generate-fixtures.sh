@@ -12,6 +12,9 @@
 #   truehd.mkv     — TrueHD 5.1 audio-only (40-sample access units)
 #   interlaced.ts  — 1080i-style MPEG-TS, field-coded, TFF (deinterlacer input)
 #   av1.mkv        — AV1 Main 10-bit + AAC (software AV1 via dav1d on most hosts)
+#   catchup.ts     — two TS chunks concatenated, each restarting its timestamps
+#   anamorphic.ts  — 720x576i PAL SD, pixel aspect 64:45 (a 16:9 picture), untagged colour
+#   hls-live/      — 12 s as six 2 s HLS segments + playlist (served live by the tests)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -160,6 +163,52 @@ CHAPTERS
         -metadata:s:s:0 language=eng \
         "$OUT/multitrack.mkv"
     echo "generated: $OUT/multitrack.mkv"
+fi
+
+# Catch-up archives are served as TS chunks glued end to end, and every chunk
+# restarts its timestamps: 6 s of media at 600 s, then 6 s more starting back
+# at 1.4 s. Without folding, the second chunk lands ten minutes before the
+# clock and everything in it is late.
+if [ ! -f "$OUT/catchup.ts" ]; then
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=6:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=6" \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+        -c:a aac -shortest -muxdelay 0 -output_ts_offset 600 -f mpegts \
+        "$OUT/catchup-a.ts"
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=6:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=660:duration=6" \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+        -c:a aac -shortest -f mpegts \
+        "$OUT/catchup-b.ts"
+    cat "$OUT/catchup-a.ts" "$OUT/catchup-b.ts" > "$OUT/catchup.ts"
+    rm -f "$OUT/catchup-a.ts" "$OUT/catchup-b.ts"
+    echo "generated: $OUT/catchup.ts"
+fi
+
+# PAL SD the way a broadcast channel carries 16:9: 720x576 interlaced with
+# 64:45 pixels, and no colour description in the stream. Interlaced, so it
+# goes through the deinterlacer and an engine-filled pixel buffer.
+gen anamorphic.ts \
+    -f lavfi -i "testsrc2=duration=2:size=720x576:rate=50" \
+    -vf "interlace=scan=tff,setsar=64/45" \
+    -c:v mpeg2video -flags +ilme+ildct -g 25 -f mpegts
+
+# HLS segments for a live channel. The tests serve the playlist without its
+# end marker first, so FFmpeg opens it as live, and with it on every refresh —
+# a provider ending the broadcast, or appending the marker during an outage.
+if [ ! -f "$OUT/hls-live/index.m3u8" ]; then
+    mkdir -p "$OUT/hls-live"
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=12:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=12" \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 50 -keyint_min 50 \
+        -c:a aac -shortest \
+        -f hls -hls_time 2 -hls_list_size 0 \
+        -hls_segment_filename "$OUT/hls-live/seg%d.ts" \
+        "$OUT/hls-live/index.m3u8"
+    echo "generated: $OUT/hls-live/index.m3u8"
 fi
 
 echo "fixtures ready in $OUT"

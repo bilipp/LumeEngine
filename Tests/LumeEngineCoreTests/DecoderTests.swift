@@ -4,6 +4,7 @@ import Foundation
 import Testing
 import VideoToolbox
 @testable import LumeEngineCore
+import CFFmpeg
 
 @Suite("Decoders", .serialized)
 struct DecoderTests {
@@ -186,6 +187,71 @@ struct DecoderTests {
             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
         ]))
+    }
+
+    @Test("video: corrupt packets do not cost the hardware decoder", .timeLimit(.minutes(1)))
+    func corruptPacketsStayInHardware() async throws {
+        // An IPTV feed with an occasional corrupt packet: hardware decoding
+        // must resync at the next keyframe, not hand the stream to software.
+        guard VideoDecoder.decoder(for: AV_CODEC_ID_H264, hardware: true) != nil else { return }
+        let (demuxer, info, _) = try await open("basic.mp4")
+        defer { demuxer.shutdown() }
+
+        let track = try #require(info.videoTracks.first)
+        let parameters = try #require(demuxer.codecParameters(forStream: track.index))
+
+        let demuxed = Channel<Packet>(capacity: 64)
+        let packets = Channel<Packet>(capacity: 64)
+        let frames = Channel<VideoFrame>(capacity: 16)
+        demuxer.attach(channel: demuxed, toStream: track.index)
+
+        // Garble the slice header of every 90th packet on its way to the
+        // decoder (one every 3 s, each in its own GOP), on a thread of its
+        // own like any data-plane stage. Much more often than that and the
+        // decoder rightly gives hardware up: software conceals corruption,
+        // where every hardware resync freezes the picture until a keyframe.
+        let corrupted = LockedBox<Int>(0)
+        let forwarder = Thread {
+            var index = 0
+            while let packet = demuxed.receive(timeout: 5) {
+                index += 1
+                if index % 90 == 0, !packet.isKeyframe,
+                   let data = packet.raw.pointee.data, packet.raw.pointee.size > 16 {
+                    for offset in 4..<16 { data[offset] = 0xFF }
+                    corrupted.set(corrupted.get() + 1)
+                }
+                guard (try? packets.send(packet)) != nil else { break }
+            }
+            packets.close()
+        }
+        forwarder.start()
+
+        let decoder = VideoDecoder(parameters: parameters, input: packets, output: frames)
+        let downgraded = LockedBox<Bool>(false)
+        let downgradeReasons = LockedBox<[String]>([])
+        let eventTask = Task {
+            for await event in decoder.events {
+                if case .downgradedToSoftware(let error) = event {
+                    downgraded.set(true)
+                    downgradeReasons.set(downgradeReasons.get() + [error.message])
+                }
+            }
+        }
+        defer { eventTask.cancel() }
+        decoder.start()
+        demuxer.resume()
+
+        var count = 0
+        var softwareFrames = 0
+        while let frame = frames.receive(timeout: 5) {
+            count += 1
+            if !frame.isHardwareDecoded { softwareFrames += 1 }
+        }
+        #expect(corrupted.get() >= 2, "the test must actually corrupt packets")
+        #expect(count > 200, "decoding must continue past the corrupt packets, got \(count) frames")
+        #expect(!downgraded.get(), "isolated corrupt packets must not downgrade to software: \(downgradeReasons.get())")
+        #expect(softwareFrames == 0)
+        decoder.shutdown()
     }
 
     @Test("video: software-only policy decodes identically", .timeLimit(.minutes(1)))
