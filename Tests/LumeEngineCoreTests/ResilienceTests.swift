@@ -293,6 +293,31 @@ struct ResilienceTests {
         await session.shutdown()
     }
 
+    @Test("an open the deadline interrupts fails instead of opening a dead source", .timeLimit(.minutes(1)))
+    func openDeadlineWhileProbing() async throws {
+        // Enough to open the container but not to finish probing, then
+        // silence. The MPEG-TS probe returns what it has when the deadline
+        // interrupts it; opening on that would leave a demuxer whose every
+        // read is already cancelled.
+        let server = try TortureHTTPServer(mode: .stallAfter(prefix: 400_000, file: Fixtures.url("wrap.ts")))
+        defer { server.stop() }
+
+        var configuration = makeConfiguration(ioTimeout: nil)
+        configuration.demuxer.openTimeout = 3
+        let session = PlayerSession(configuration: configuration)
+        let started = Date()
+        do {
+            _ = try await session.open(url: server.url)
+            Issue.record("open must fail once its deadline interrupted it")
+        } catch let error as EngineError {
+            #expect(error.code == .openFailed)
+            #expect(error.message.contains("timed out"), "\(error)")
+        }
+        #expect(Date().timeIntervalSince(started) < 10, "the deadline bounds open")
+        #expect(await session.state == .failed)
+        await session.shutdown()
+    }
+
     @Test("mid-stream stall fires the watchdog", .timeLimit(.minutes(2)))
     func midStreamStall() async throws {
         // ~1 MB of a ~2 MB TS: enough to open, probe, and start, then silence.
