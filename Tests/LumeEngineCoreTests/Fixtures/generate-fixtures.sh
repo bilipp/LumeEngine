@@ -19,6 +19,7 @@
 #   ac4.ts         — TS whose first audio (ger) is declared AC-4, which no decoder here plays, then eng AAC
 #   hdr10.mp4      — HEVC Main 10, BT.2020 PQ, mastering display + content light level SEI, HDR10+ per frame
 #   surround51.ts  — 20 s H.264 + AC-3 5.1 MPEG-TS, tone in the centre channel only
+#   captions.ts    — H.264 TS with CEA-608 captions in A/53 SEI (1–3 s, 4–6 s; needs python3)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -340,5 +341,91 @@ gen surround51.ts \
     -filter_complex "[1:a]pan=5.1(side)|FC=c0[a]" -map 0:v -map "[a]" \
     -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
     -c:a ac3 -b:a 384k -shortest -f mpegts
+
+# Closed captions the way US broadcast and much IPTV carry them: CEA-608
+# byte pairs inside the video, as A/53 user data in an SEI message on every
+# frame — not as a subtitle stream. No ffmpeg CLI option writes captions from
+# a caption file into the video, so a short script puts the SEI in front of
+# each picture of a B-frame-free encode, so the n-th picture in the file is
+# the n-th on screen. Two pop-on captions, each loaded off screen first:
+# "HELLO CAPTIONS" shown at 1 s and erased at 3 s, "SECOND CAPTION" at 4–6 s.
+if [ ! -f "$OUT/captions.ts" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        "$FFMPEG" -hide_banner -loglevel error -y \
+            -f lavfi -i "testsrc2=duration=8:size=320x180:rate=30" \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -bf 0 -g 30 \
+            -f h264 "$OUT/captions-source.h264"
+        python3 -I - "$OUT/captions-source.h264" "$OUT/captions.h264" <<'PY'
+import sys
+
+source, destination = sys.argv[1], sys.argv[2]
+stream = open(source, 'rb').read()
+
+def nal_units(data):
+    starts = []
+    index = 0
+    while True:
+        found = data.find(b'\x00\x00\x01', index)
+        if found < 0:
+            break
+        starts.append(found + 3)
+        index = found + 3
+    for position, start in enumerate(starts):
+        end = starts[position + 1] - 3 if position + 1 < len(starts) else len(data)
+        yield data[start:end].rstrip(b'\x00')
+
+def odd_parity(value):
+    value &= 0x7F
+    return value | (0x80 if bin(value).count('1') % 2 == 0 else 0)
+
+# frame -> CEA-608 byte pair for CC1 (field 1); every other frame carries nulls.
+script = {}
+def pop_on(load, text, show, clear):
+    pairs = [(0x14, 0x20), (0x14, 0x70)]  # resume caption loading, row 15
+    for i in range(0, len(text), 2):
+        pairs.append((ord(text[i]), ord(text[i + 1]) if i + 1 < len(text) else 0))
+    for offset, pair in enumerate(pairs):
+        script[load + offset] = pair
+    script[show] = (0x14, 0x2F)   # end of caption: swap it on screen
+    script[clear] = (0x14, 0x2C)  # erase displayed memory
+
+pop_on(5, 'HELLO CAPTIONS', 30, 90)
+pop_on(100, 'SECOND CAPTION', 120, 180)
+
+def sei(frame):
+    first, second = script.get(frame, (0, 0))
+    cc_data = bytes([0xFC, odd_parity(first), odd_parity(second), 0xFD, 0x80, 0x80])
+    # ITU-T T.35: United States, ATSC, 'GA94', cc_data with two triples.
+    payload = bytes([0xB5, 0x00, 0x31]) + b'GA94' + bytes([0x03, 0x40 | 2, 0xFF]) + cc_data + bytes([0xFF])
+    rbsp = bytes([4, len(payload)]) + payload + bytes([0x80])
+    nal = bytearray([0x06])
+    zeros = 0
+    for byte in rbsp:
+        if zeros >= 2 and byte <= 3:
+            nal.append(3)  # emulation prevention
+            zeros = 0
+        nal.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return bytes(nal)
+
+out = bytearray()
+frame = 0
+for nal in nal_units(stream):
+    # First slice of a picture: a slice NAL whose first_mb_in_slice is 0.
+    if nal and nal[0] & 0x1F in (1, 5) and len(nal) > 1 and nal[1] & 0x80:
+        out += b'\x00\x00\x00\x01' + sei(frame)
+        frame += 1
+    out += b'\x00\x00\x00\x01' + nal
+open(destination, 'wb').write(out)
+PY
+        "$FFMPEG" -hide_banner -loglevel error -y \
+            -framerate 30 -i "$OUT/captions.h264" -c:v copy -f mpegts \
+            "$OUT/captions.ts"
+        rm -f "$OUT/captions-source.h264" "$OUT/captions.h264"
+        echo "generated: $OUT/captions.ts"
+    else
+        echo "skipped: $OUT/captions.ts (needs python3)" >&2
+    fi
+fi
 
 echo "fixtures ready in $OUT"

@@ -140,6 +140,10 @@ public final class VideoDecoder: @unchecked Sendable {
 
     private let maxConsecutiveErrors = 100
 
+    /// Closed captions riding in the video (A/53 side data) leave here, ahead
+    /// of deinterlacing and conversion, for the session's caption lane.
+    let captionTap = ClosedCaptionTap()
+
     public init(
         parameters: CodecParameters,
         input: Channel<Packet>,
@@ -365,6 +369,7 @@ public final class VideoDecoder: @unchecked Sendable {
             consecutiveErrors = 0
             if usingHardware { hardwareFailures.recordFrame() }
             noteFrameSource(frame)
+            captionTap.offer(frame, serial: currentSerial ?? 0)
             emit(frame: frame)
             av_frame_unref(frame)
         }

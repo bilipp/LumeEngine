@@ -201,6 +201,11 @@ public final class LumePlayer {
     private func tick() async {
         guard let session else { return }
         position = await session.position
+        // Tracks can turn up after open (closed captions in the video).
+        if let mediaInfo, let current = await session.mediaInfo,
+           current.tracks.count != mediaInfo.tracks.count {
+            self.mediaInfo = current
+        }
 
         let now = session.renderer.currentTime
         if MediaTime.isValid(now) {

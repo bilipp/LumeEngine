@@ -3,13 +3,24 @@ import Foundation
 
 /// Text subtitle decode stage: `Channel<Packet>` in, `SubtitleStore` out.
 /// Runs `avcodec_decode_subtitle2`, so every FFmpeg text subtitle codec
-/// (subrip, ass, webvtt, mov_text, eia_608 CC) feeds one cue model.
+/// (subrip, ass, webvtt, mov_text, eia_608 CC) feeds one cue model — and
+/// so does the closed-caption lane, whose packets come from the video decoder
+/// (`ClosedCaptionTap`) rather than the demuxer. Each decoded update goes to
+/// the store as a `SubtitleEvent`; how long it shows is the store's policy.
 /// Bitmap codecs (PGS/DVB/VobSub) are recognized but skipped for now.
 public final class SubtitleDecoder: @unchecked Sendable {
     public let store: SubtitleStore
 
     private let parameters: CodecParameters
     private let input: Channel<Packet>
+    private let codecOptions: [String: String]
+    /// Each update is the whole screen (closed captions, bitmap formats) —
+    /// see `SubtitleEvent.replacesPrevious`.
+    private let replacesPrevious: Bool
+    /// CEA-608 captions run in FFmpeg's real-time mode (below), which stamps
+    /// an update with the time of the *previous* one; the packet that caused
+    /// it carries the time it actually shows.
+    private let isClosedCaptions: Bool
 
     private let lock = NSCondition()
     private var started = false
@@ -17,11 +28,39 @@ public final class SubtitleDecoder: @unchecked Sendable {
     private var stopRequested = false
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+    /// Decode-thread-only: seek generation of the last packet.
+    private var currentSerial: UInt64?
 
-    public init(parameters: CodecParameters, input: Channel<Packet>, store: SubtitleStore = SubtitleStore()) {
+    public convenience init(parameters: CodecParameters, input: Channel<Packet>, store: SubtitleStore = SubtitleStore()) {
+        self.init(parameters: parameters, input: input, store: store, codecOptions: [:])
+    }
+
+    /// `codecOptions` go to `avcodec_open2` (the caption lane picks its field).
+    init(parameters: CodecParameters, input: Channel<Packet>, store: SubtitleStore, codecOptions: [String: String]) {
         self.parameters = parameters
         self.input = input
         self.store = store
+        let codecID = parameters.raw.pointee.codec_id
+        isClosedCaptions = codecID == AV_CODEC_ID_EIA_608
+        replacesPrevious = Self.replacesPrevious(codecID)
+        var options = codecOptions
+        if isClosedCaptions, options["real_time"] == nil {
+            // Real-time mode emits each screen change as it is decoded, open
+            // ended, and a clear as an empty update. The default buffered mode
+            // emits a caption only once the next change has ended it — after
+            // its own duration, by which time playback (a fraction of a second
+            // behind decode) has already passed most of it.
+            options["real_time"] = "1"
+        }
+        self.codecOptions = options
+    }
+
+    /// Formats where every update describes the whole screen and stays until
+    /// the next one: closed captions, teletext, and the bitmap formats.
+    static func replacesPrevious(_ codecID: AVCodecID) -> Bool {
+        if codecID == AV_CODEC_ID_EIA_608 || codecID == AV_CODEC_ID_DVB_TELETEXT { return true }
+        guard let descriptor = avcodec_descriptor_get(codecID) else { return false }
+        return descriptor.pointee.props & AV_CODEC_PROP_BITMAP_SUB != 0
     }
 
     public func start() {
@@ -122,19 +161,35 @@ public final class SubtitleDecoder: @unchecked Sendable {
     private func decode(packet: Packet) {
         guard let context = codecContext else { return }
 
+        // Seek boundary: decoders with screen state (caption roll-up rows,
+        // PGS/DVB object and palette sets) must not carry it across.
+        if let serial = currentSerial, serial != packet.serial {
+            avcodec_flush_buffers(context)
+        }
+        currentSerial = packet.serial
+
         var subtitle = AVSubtitle()
         var gotSubtitle: Int32 = 0
         let result = avcodec_decode_subtitle2(context, &subtitle, &gotSubtitle, packet.raw)
         guard result >= 0, gotSubtitle != 0 else { return }
         defer { avsubtitle_free(&subtitle) }
 
-        // Packet timestamps are engine µs; display offsets are milliseconds.
-        let basePTS = MediaTime.isValid(packet.pts) ? packet.pts : 0
-        let start = basePTS + Int64(subtitle.start_display_time) * 1_000
-        var end = basePTS + Int64(subtitle.end_display_time) * 1_000
-        if subtitle.end_display_time == 0 || end <= start {
-            end = packet.duration > 0 ? basePTS + packet.duration : start + 3_000_000
+        // Packet timestamps are engine µs, and so is `subtitle.pts`
+        // (`pkt_timebase` is µs; PGS takes it from its presentation segment);
+        // display offsets are milliseconds.
+        let base: Int64
+        if !isClosedCaptions, MediaTime.isValid(subtitle.pts) {
+            base = subtitle.pts
+        } else {
+            base = MediaTime.isValid(packet.pts) ? packet.pts : 0
         }
+        let span = SubtitleEvent.span(
+            base: base,
+            startDisplay: isClosedCaptions ? 0 : subtitle.start_display_time,
+            endDisplay: subtitle.end_display_time,
+            packetDuration: packet.duration,
+            replacesPrevious: replacesPrevious
+        )
 
         var lines: [String] = []
         for i in 0..<Int(subtitle.num_rects) {
@@ -152,14 +207,28 @@ public final class SubtitleDecoder: @unchecked Sendable {
                 break // bitmap subtitle — deferred (libass/PGS pack)
             }
         }
-        let text = lines.joined(separator: "\n")
+        var text = lines.joined(separator: "\n")
+        if isClosedCaptions {
+            // Caption rows are indented by column position, which a text
+            // overlay does not reproduce.
+            text = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .joined(separator: "\n")
+        }
         // Checked under the lock a stop is requested under: a cue decoded
         // while the lane was being retired must not land after the session
         // cleared the store for the next track (see `requestStop`).
         lock.lock()
         defer { lock.unlock() }
         guard !stopRequested else { return }
-        store.insert(start: start, end: end, text: text)
+        // An update with nothing to show is kept: on a replacing track it is
+        // the clear that ends what is on screen.
+        store.apply(SubtitleEvent(
+            start: span.start,
+            end: span.end,
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            replacesPrevious: replacesPrevious
+        ))
     }
 
     /// The decoder the subtitle lane opens for `codecID`; also what
@@ -178,7 +247,12 @@ public final class SubtitleDecoder: @unchecked Sendable {
             return false
         }
         context.pointee.pkt_timebase = lume_av_time_base_q()
-        guard avcodec_open2(context, codec, nil) >= 0 else {
+        var options: OpaquePointer?
+        for (key, value) in codecOptions {
+            av_dict_set(&options, key, value, 0)
+        }
+        defer { av_dict_free(&options) }
+        guard avcodec_open2(context, codec, &options) >= 0 else {
             var pointer: UnsafeMutablePointer<AVCodecContext>? = context
             avcodec_free_context(&pointer)
             return false
