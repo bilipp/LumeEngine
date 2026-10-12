@@ -227,9 +227,7 @@ public actor PlayerSession {
         // seeking live sources that do not survive one (see
         // `TrackLanguageMatcher`). An empty preference list matches nothing,
         // so a default configuration behaves exactly as it did before.
-        let videoTrack = configuration.enableVideo
-            ? info.videoTracks.first(where: \.isDefault) ?? info.videoTracks.first
-            : nil
+        let videoTrack = configuration.enableVideo ? defaultVideoTrack(in: info) : nil
         let audioTrack = configuration.enableAudio ? defaultAudioTrack(in: info) : nil
 
         guard videoTrack != nil || audioTrack != nil else {
@@ -566,9 +564,28 @@ public actor PlayerSession {
     /// source carries it, else the source's own default. Shared with
     /// `setAudioEnabled` so a lane switched on later lands on the same track the
     /// session would have opened with.
+    ///
+    /// Tracks this build cannot decode (AC-4 or MPEG-H next to an AC-3 track
+    /// in a DVB mux) are passed over, even when they match the language or
+    /// carry the default flag: a playable track in another language beats a
+    /// lane that fails at once. With nothing decodable the choice is what it
+    /// always was, and that lane's failure is the typed error.
     func defaultAudioTrack(in info: MediaInfo) -> TrackInfo? {
-        TrackLanguageMatcher.bestMatch(in: info.audioTracks, preferring: configuration.preferredAudioLanguages)
-            ?? info.audioTracks.first(where: \.isDefault) ?? info.audioTracks.first
+        func choose(_ tracks: [TrackInfo]) -> TrackInfo? {
+            TrackLanguageMatcher.bestMatch(in: tracks, preferring: configuration.preferredAudioLanguages)
+                ?? tracks.first(where: \.isDefault) ?? tracks.first
+        }
+        return choose(info.audioTracks.filter(\.isDecodable)) ?? choose(info.audioTracks)
+    }
+
+    /// The video track `open` chooses: the default, else the first, passing
+    /// over tracks this build cannot decode the same way `defaultAudioTrack`
+    /// does.
+    func defaultVideoTrack(in info: MediaInfo) -> TrackInfo? {
+        func choose(_ tracks: [TrackInfo]) -> TrackInfo? {
+            tracks.first(where: \.isDefault) ?? tracks.first
+        }
+        return choose(info.videoTracks.filter(\.isDecodable)) ?? choose(info.videoTracks)
     }
 
     /// Tears the audio lane down completely, leaving the session playing video

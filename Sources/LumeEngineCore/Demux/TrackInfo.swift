@@ -47,6 +47,14 @@ public struct TrackInfo: Sendable, Identifiable, Equatable {
     /// Container timestamp width for this stream (`AVStream.pts_wrap_bits`);
     /// drives the wrap unwrapper.
     public let wrapBits: Int32
+
+    /// Whether this build has a decoder the engine would open for the track:
+    /// for video on either the VideoToolbox or the software path. False for
+    /// codecs FFmpeg demuxes but cannot decode — AC-4 and MPEG-H 3D Audio in
+    /// DVB/ATSC muxes are the usual ones — and for data and attachment
+    /// streams. Such tracks are listed but never chosen automatically;
+    /// selecting one explicitly ends in a `.decoderInitFailed` error.
+    public internal(set) var isDecodable = true
 }
 
 /// A chapter marker, in engine microseconds.

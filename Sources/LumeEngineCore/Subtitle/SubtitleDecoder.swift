@@ -146,8 +146,14 @@ public final class SubtitleDecoder: @unchecked Sendable {
         store.insert(start: start, end: end, text: text)
     }
 
+    /// The decoder the subtitle lane opens for `codecID`; also what
+    /// `TrackInfo.isDecodable` asks, so the two cannot disagree.
+    static func decoder(for codecID: AVCodecID) -> UnsafePointer<AVCodec>? {
+        avcodec_find_decoder(codecID)
+    }
+
     private func setupCodec() -> Bool {
-        guard let codec = avcodec_find_decoder(parameters.raw.pointee.codec_id),
+        guard let codec = Self.decoder(for: parameters.raw.pointee.codec_id),
               let context = avcodec_alloc_context3(codec)
         else { return false }
         guard avcodec_parameters_to_context(context, parameters.raw) >= 0 else {

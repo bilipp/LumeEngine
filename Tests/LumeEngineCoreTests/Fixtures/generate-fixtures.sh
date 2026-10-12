@@ -16,6 +16,7 @@
 #   anamorphic.ts  — 720x576i PAL SD, pixel aspect 64:45 (a 16:9 picture), untagged colour
 #   hls-live/      — 12 s as six 2 s HLS segments + playlist (served live by the tests)
 #   replay.ts      — 8 s TS whose bytes jump back ~3 s at ~6 s, as a reconnect replays them
+#   ac4.ts         — TS whose first audio (ger) is declared AC-4, which no decoder here plays, then eng AAC
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -230,6 +231,72 @@ if [ ! -f "$OUT/replay.ts" ]; then
     } > "$OUT/replay.ts"
     rm -f "$OUT/replay-source.ts"
     echo "generated: $OUT/replay.ts"
+fi
+
+# A DVB mux whose first audio track is AC-4, which this FFmpeg build has no
+# decoder (or parser) for. No encoder writes AC-4, so an AC-3 track is
+# re-declared in every PMT: stream_type 0x06 plus an "AC-4" registration
+# descriptor (the language descriptor is kept), with the section CRC redone.
+# The payload stays AC-3; nothing ever decodes it.
+if [ ! -f "$OUT/ac4.ts" ]; then
+    "$FFMPEG" -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=duration=6:size=320x180:rate=25" \
+        -f lavfi -i "sine=frequency=440:duration=6" \
+        -f lavfi -i "sine=frequency=880:duration=6" \
+        -map 0:v -map 1:a -map 2:a \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+        -c:a:0 ac3 -c:a:1 aac -metadata:s:a:0 language=ger -metadata:s:a:1 language=eng \
+        -shortest -muxdelay 0 -f mpegts "$OUT/ac4-source.ts"
+    python3 -I - "$OUT/ac4-source.ts" "$OUT/ac4.ts" <<'PATCH'
+import sys
+PMT_PID, TARGET_PID = 0x1000, 0x101  # the muxer's defaults: PMT, first audio
+
+def crc32_mpeg(data):
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7 if crc & 0x80000000 else crc << 1) & 0xFFFFFFFF
+    return crc
+
+data = bytearray(open(sys.argv[1], "rb").read())
+patched = 0
+for off in range(0, len(data), 188):
+    pkt = data[off:off + 188]
+    if ((pkt[1] & 0x1F) << 8 | pkt[2]) != PMT_PID or not pkt[1] & 0x40:
+        continue
+    p = 4 + (1 + pkt[4] if pkt[3] & 0x20 else 0)
+    p += 1 + pkt[p]  # pointer field
+    sec = pkt[p:]
+    body = sec[3:3 + ((sec[1] & 0x0F) << 8 | sec[2]) - 4]
+    info_len = (body[7] & 0x0F) << 8 | body[8]
+    head, es = body[:9 + info_len], body[9 + info_len:]
+    out, i = bytearray(), 0
+    while i < len(es):
+        stream_type, pid = es[i], (es[i + 1] & 0x1F) << 8 | es[i + 2]
+        desc_len = (es[i + 3] & 0x0F) << 8 | es[i + 4]
+        desc = bytes(es[i + 5:i + 5 + desc_len])
+        if pid == TARGET_PID:
+            kept, j = b"", 0
+            while j < len(desc):  # drop AC-3/E-AC-3/registration descriptors
+                if desc[j] not in (0x05, 0x6A, 0x7A, 0x81):
+                    kept += desc[j:j + 2 + desc[j + 1]]
+                j += 2 + desc[j + 1]
+            stream_type, desc = 0x06, kept + b"\x05\x04AC-4"
+            patched += 1
+        out += bytes([stream_type, es[i + 1], es[i + 2], 0xF0 | len(desc) >> 8, len(desc) & 0xFF]) + desc
+        i += 5 + desc_len
+    new = bytes(head) + bytes(out)
+    new = bytes([sec[0], (sec[1] & 0xF0) | (len(new) + 4) >> 8, (len(new) + 4) & 0xFF]) + new
+    new += crc32_mpeg(new).to_bytes(4, "big")
+    assert len(new) <= 188 - p
+    data[off + p:off + 188] = new + b"\xff" * (188 - p - len(new))
+if not patched:
+    sys.exit("ac4.ts: no PMT entry for the first audio track")
+open(sys.argv[2], "wb").write(data)
+PATCH
+    rm -f "$OUT/ac4-source.ts"
+    echo "generated: $OUT/ac4.ts"
 fi
 
 echo "fixtures ready in $OUT"

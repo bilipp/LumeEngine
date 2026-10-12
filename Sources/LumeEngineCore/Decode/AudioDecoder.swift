@@ -393,8 +393,14 @@ public final class AudioDecoder: @unchecked Sendable {
         }
     }
 
+    /// The decoder the audio lane opens for `codecID`; also what
+    /// `TrackInfo.isDecodable` asks, so the two cannot disagree.
+    static func decoder(for codecID: AVCodecID) -> UnsafePointer<AVCodec>? {
+        avcodec_find_decoder(codecID)
+    }
+
     private func setupCodec() -> Bool {
-        guard let codec = avcodec_find_decoder(parameters.raw.pointee.codec_id),
+        guard let codec = Self.decoder(for: parameters.raw.pointee.codec_id),
               let context = avcodec_alloc_context3(codec)
         else { return false }
 
