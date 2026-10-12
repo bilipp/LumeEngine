@@ -123,24 +123,6 @@ extension DolbyVisionMapping {
         )
     }
 
-    /// True when the stream's Dolby Vision configuration says the base layer
-    /// is IPTPQc2 rather than a displayable fallback (HDR10, SDR, HLG). A frame
-    /// tagged `AVCOL_SPC_IPT_C2` says the same, but many profile 5 encodes
-    /// leave the VUI matrix unspecified, so the configuration record decides.
-    static func baseLayerIsIPT(_ parameters: UnsafePointer<AVCodecParameters>) -> Bool {
-        guard let sideData = av_packet_side_data_get(
-            parameters.pointee.coded_side_data,
-            parameters.pointee.nb_coded_side_data,
-            AV_PKT_DATA_DOVI_CONF
-        ), let bytes = sideData.pointee.data,
-           sideData.pointee.size >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
-        else { return false }
-        let record = UnsafeRawPointer(bytes).loadUnaligned(as: AVDOVIDecoderConfigurationRecord.self)
-        // Profile 4 also reports ID 0, but its base layer is SDR plus an
-        // enhancement layer this path does not decode.
-        return record.dv_bl_signal_compatibility_id == 0 && [5, 10, 20].contains(record.dv_profile)
-    }
-
     private static func value(_ rational: AVRational) -> Double {
         rational.den == 0 ? 0 : Double(rational.num) / Double(rational.den)
     }
