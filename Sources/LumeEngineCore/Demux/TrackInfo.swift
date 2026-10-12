@@ -111,6 +111,21 @@ public struct DolbyVisionConfiguration: Sendable, Equatable {
     }
 }
 
+extension TrackInfo {
+    /// Index of the closed-caption track carried inside the video stream
+    /// (CEA-608 in A/53 side data — how US broadcast and much IPTV ship
+    /// captions). It is no container stream, so it gets an index no container
+    /// reaches ("CC" in ASCII, channel 1); pass it to `selectSubtitleTrack`
+    /// like any other subtitle index.
+    public static let embeddedClosedCaptionsIndex: Int32 = 0x4343_0001
+
+    /// True for the synthetic closed-caption track (`embeddedClosedCaptionsIndex`),
+    /// which `PlayerSession.mediaInfo` lists once captions turn up in the video.
+    public var isEmbeddedClosedCaptions: Bool {
+        index == Self.embeddedClosedCaptionsIndex
+    }
+}
+
 /// A chapter marker, in engine microseconds.
 public struct ChapterInfo: Sendable, Equatable {
     public let title: String?
@@ -135,7 +150,9 @@ public struct MediaInfo: Sendable {
     public let isSeekable: Bool
     public let bitrate: Int64
     public let metadata: [String: String]
-    public let tracks: [TrackInfo]
+    /// Streams found at open, plus tracks discovered while playing (the
+    /// closed-caption track — see `PlayerSession.mediaInfo`).
+    public internal(set) var tracks: [TrackInfo]
     public let chapters: [ChapterInfo]
 
     public var videoTracks: [TrackInfo] { tracks.filter { $0.kind == .video } }
@@ -144,4 +161,13 @@ public struct MediaInfo: Sendable {
 
     /// Live heuristic: no known duration.
     public var isLive: Bool { duration == nil }
+
+    /// This info with `track` appended, unless a track with its index is
+    /// already listed.
+    func adding(_ track: TrackInfo) -> MediaInfo {
+        guard !tracks.contains(where: { $0.index == track.index }) else { return self }
+        var copy = self
+        copy.tracks.append(track)
+        return copy
+    }
 }

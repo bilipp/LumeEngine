@@ -52,8 +52,15 @@ extension PlayerSession {
     }
 
     /// Selects an embedded subtitle track, or `nil` to disable subtitles.
+    /// `TrackInfo.embeddedClosedCaptionsIndex` selects the captions carried in
+    /// the video stream — also before they have turned up in `mediaInfo`, so
+    /// a host can keep captions on across channels.
     public func selectSubtitleTrack(_ index: Int32?) {
         teardownSubtitleLane()
+        if index == TrackInfo.embeddedClosedCaptionsIndex {
+            attachClosedCaptionLane()
+            return
+        }
         guard let index,
               let demuxer = activeDemuxer,
               let parameters = demuxer.codecParameters(forStream: index)
@@ -81,6 +88,33 @@ extension PlayerSession {
         case .idle, .opening, .ended, .failed:
             break // no demuxer progress to recover from
         }
+    }
+
+    /// Feeds the captions the video decoder finds (see `ClosedCaptionTap`)
+    /// to a caption decoder writing into the cue store.
+    ///
+    /// No backfill seek, unlike a subtitle stream: the captions ride in video
+    /// frames that are decoded a fraction of a second ahead of the playhead,
+    /// so nothing worth recovering has been read past — and live sources,
+    /// where captions mostly are, do not survive a seek.
+    private func attachClosedCaptionLane() {
+        guard let video = activeVideoDecoder,
+              let parameters = CodecParameters.closedCaptions()
+        else { return }
+        // One payload per frame: a few seconds of slack for a decoder that
+        // falls behind, beyond which captions are dropped, never frames.
+        let packets = Channel<Packet>(capacity: 256)
+        let decoder = SubtitleDecoder(
+            parameters: parameters,
+            input: packets,
+            store: subtitles,
+            // CC1/CC2. FFmpeg would otherwise lock onto whichever field's
+            // data comes first, which can be field 2's metadata.
+            codecOptions: ["data_field": "first"]
+        )
+        installSubtitleLane(trackIndex: TrackInfo.embeddedClosedCaptionsIndex, packets: packets, decoder: decoder)
+        decoder.start()
+        video.captionTap.attach(packets)
     }
 
     /// Loads a sidecar subtitle file (SRT/VTT/ASS/…) into the session's cue

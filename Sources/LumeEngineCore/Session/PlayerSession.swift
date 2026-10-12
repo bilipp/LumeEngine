@@ -395,7 +395,15 @@ public actor PlayerSession {
         info?.duration.map(MediaTime.seconds)
     }
 
-    public var mediaInfo: MediaInfo? { info }
+    /// What `open` returned, plus tracks found since: the closed-caption track
+    /// (`TrackInfo.embeddedClosedCaptionsIndex`) appears once captions turn up
+    /// in the video, which no open-time probe can tell. Re-read it to offer
+    /// that track; `.opened` carries the open-time value only.
+    public var mediaInfo: MediaInfo? {
+        guard let info else { return nil }
+        guard videoDecoder?.captionTap.hasDetectedCaptions == true else { return info }
+        return info.adding(.embeddedClosedCaptions)
+    }
 
     /// How far startup has got and how long each step took.
     public var startup: StartupTimeline {
@@ -579,6 +587,7 @@ public actor PlayerSession {
         demuxAtEOF = false
         videoAtEOF = false
         audioAtEOF = false
+        subtitles.closeOpenCues(at: target)
         demuxer.seek(to: target)
         // Completion continues in handleDemux(.didSeek).
     }
@@ -727,6 +736,7 @@ public actor PlayerSession {
         if let old = selectedSubtitleTrackIndex {
             demuxer?.detach(streamIndex: old)
         }
+        videoDecoder?.captionTap.attach(nil)
         if let retired = subtitleDecoder {
             retired.requestStop() // no cue of the old track lands after `removeAll` below
             retire { retired.shutdown(deadline: 2) }
