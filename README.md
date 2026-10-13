@@ -101,10 +101,27 @@ swift run LumeEngineDemo                         # macOS demo with diagnostics H
 
 Testing needs a host `ffmpeg` CLI (`brew install ffmpeg`) to generate fixtures on first run — a build-time tool, unrelated to the FFmpeg the engine links. The full 10-slice matrix (`build/scripts/platforms.sh`) is only needed for release binaries, which CI builds on tags.
 
+## Debugging streams with lumectl
+
+`lumectl` (macOS) plays a URL headlessly through the engine and prints what it reports, so a stream problem — a slow start, stalls, a reconnect that replays media, timestamp seams, a hardware decoder falling back, an HTTP error — can be reproduced from a terminal without the app:
+
+```bash
+swift run lumectl probe 'http://provider.example:8080/live/user/pass/1234.ts'
+swift run lumectl play  'http://provider.example:8080/live/user/pass/1234.ts' --duration 60
+swift run lumectl play  stream.m3u8 --json --record-events run.jsonl --interval 1
+```
+
+`probe` prints the container, duration, start time, live/seekable flags and every track (codec, language, resolution, frame rate, bit depth, HDR transfer and colour tags). `play` runs a muted session and prints every `PlayerEvent` with a timestamp, a diagnostics heartbeat (queue depths, renderer health, delivery rate, timeline seams, replayed packets), the startup timeline once the first frame shows, the stalled stage on every stall, and the typed error — with its HTTP status class — on failure. `--json` switches stdout to JSON Lines; `--record-events FILE` keeps a JSON Lines copy next to the readable output.
+
+The exit status tells the outcome apart for scripted repro loops: `0` ok, `3` the source never opened, `4` playback failed, `5` stalled (without failing), `2` bad arguments. Ctrl-C ends a run cleanly with a summary.
+
+URLs are printed as scheme and host only (`http://provider.example:8080/[redacted].ts`), because IPTV URLs carry the account; header values are never printed. Pass `--show-urls` to see them in full. `lumectl --help` lists every option: start position, mid-stream seek, software decoding, preferred audio languages, a single lane, custom headers, user agent, referer, reconnect and timeouts.
+
 ## Layout
 
 - `Sources/LumeEngineCore` — demux, decode, render, session, subtitles, media integration (no UI)
 - `Sources/LumeEngine` — public facade: `LumePlayer`, `LumePlayerView`
+- `Sources/lumectl`, `Sources/LumeCtlCore` — the `lumectl` command-line tool
 - `build/` — FFmpeg build pipeline (versions manifest, scripts, patches)
 - `DemoApp/` — macOS demo with diagnostics HUD
 - `Tests/` — including a fault-injecting HTTP torture server
