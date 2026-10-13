@@ -45,6 +45,8 @@ public final class SystemRenderer: @unchecked Sendable {
     private var videoPumpScheduled = false
     private var audioPumpScheduled = false
     private var stopped = false
+    /// Tests only: the audio pump feeds nothing (see `stopFeedingAudio`).
+    private var audioFeedStopped = false
 
     // Queue-confined format caches.
     private var videoFormatCache: CMVideoFormatDescription?
@@ -447,7 +449,7 @@ public final class SystemRenderer: @unchecked Sendable {
         lock.lock()
         let input = audioInput
         let serial = acceptedSerial
-        let isStopped = stopped
+        let isStopped = stopped || audioFeedStopped
         lock.unlock()
         guard let input, !isStopped else { return }
 
@@ -487,6 +489,16 @@ public final class SystemRenderer: @unchecked Sendable {
                 continue
             }
         }
+    }
+
+    /// Stands in for an audio renderer that stops taking data while video
+    /// plays on: no callback and no retry feeds it again. Tests only — merely
+    /// calling `stopRequestingMediaData()` leaves a pending retry feeding it.
+    func stopFeedingAudio() {
+        lock.lock()
+        audioFeedStopped = true
+        lock.unlock()
+        audioRenderer.stopRequestingMediaData()
     }
 
     /// Keeps `sample` until the clock has played past it. Audio queue only.

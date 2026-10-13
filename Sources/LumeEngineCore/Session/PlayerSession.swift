@@ -1123,6 +1123,15 @@ public actor PlayerSession {
                 return
             }
             startHoldDeadline = nil
+            // A seek's landing is judged by what reached the renderer, which
+            // can trail the lanes filling up. Started before that, the clock
+            // runs from the requested target, and a landing elsewhere then
+            // pulls it back mid-play.
+            verifySeekLanding()
+            if seekLandingTarget != nil, !allEOF {
+                if state != .buffering { state = .buffering }
+                return
+            }
             // Start when every lane is as buffered as it can usefully get,
             // or when EOF means no more is coming.
             if allLanesReady || allEOF || demuxAtEOF {
