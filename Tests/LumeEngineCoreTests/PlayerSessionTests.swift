@@ -168,6 +168,33 @@ struct PlayerSessionTests {
         await session.shutdown()
     }
 
+    @Test("the clock starts where every lane has a frame to present", .timeLimit(.minutes(1)))
+    func startsAtFirstPresentableFrame() async throws {
+        // No buffer target: the runway gate opens at once, so only waiting
+        // for the lanes' first frames keeps audio from starting under a
+        // picture that has nothing to show yet.
+        var configuration = PlayerConfiguration()
+        configuration.muted = true
+        configuration.bufferTarget = 0
+        let session = PlayerSession(configuration: configuration)
+        _ = try await session.open(url: try Fixtures.path("videolate.ts"))
+        await session.play()
+        let playing = await eventually(interval: .milliseconds(10)) { await session.state == .playing }
+        #expect(playing, "session must reach .playing")
+
+        let diagnostics = await session.diagnostics
+        #expect(diagnostics.startup.firstVideoFrame != nil, "the clock must not run before video has a frame")
+        // Video starts 2 s in; started at the audio's start instead, the
+        // picture would sit empty for two seconds of sound.
+        #expect(diagnostics.videoFirstSeconds >= 0)
+        #expect(
+            diagnostics.playheadSeconds >= diagnostics.videoFirstSeconds - 0.05,
+            "clock must start at the first video frame: playhead \(diagnostics.playheadSeconds), video from \(diagnostics.videoFirstSeconds)"
+        )
+        #expect(await session.position > 1.8, "playback must start where the picture does")
+        await session.shutdown()
+    }
+
     @Test("audio the renderer drops on its own is enqueued again", .timeLimit(.minutes(1)))
     func automaticAudioFlush() async throws {
         let session = makeSession()

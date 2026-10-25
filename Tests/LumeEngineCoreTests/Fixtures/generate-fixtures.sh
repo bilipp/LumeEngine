@@ -94,6 +94,16 @@ gen av1.mkv \
     -c:v libsvtav1 -preset 12 -pix_fmt yuv420p10le -g 24 \
     -c:a aac -shortest
 
+# Video starting 2 s after audio, as a live TS joined mid-GOP delivers it
+# (the video decoder has nothing to show before the first keyframe): the
+# clock must start where the picture does, not under audio alone.
+gen videolate.ts \
+    -f lavfi -i "sine=frequency=440:duration=8" \
+    -itsoffset 2 -f lavfi -i "testsrc2=duration=6:size=320x180:rate=25" \
+    -map 1:v -map 0:a \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 \
+    -c:a aac -muxdelay 0 -f mpegts
+
 gen interlaced.ts \
     -f lavfi -i "testsrc2=duration=4:size=640x360:rate=50" \
     -vf "interlace=scan=tff" \
