@@ -1132,10 +1132,29 @@ public actor PlayerSession {
                 if state != .buffering { state = .buffering }
                 return
             }
-            // Start when every lane is as buffered as it can usefully get,
-            // or when EOF means no more is coming.
-            if allLanesReady || allEOF || demuxAtEOF {
-                renderer.setRate(targetRate)
+            // Start when every lane is as buffered as it can usefully get and
+            // has something at its renderer, or when EOF means no more is
+            // coming. The runway counts packets, so a lane can be "ready"
+            // before its decoder has produced a frame — a cold VideoToolbox
+            // session takes that long on first launch. Started then, audio
+            // plays over a frozen picture and the late video frames are shown
+            // as fast as they decode until they catch up with the clock.
+            // Demux EOF ends the buffering, not the wait for a first frame:
+            // the decoders still hold what was read, and a lane that never
+            // produces a frame drains to EOF and leaves the gate.
+            let buffered = allLanesReady || demuxAtEOF
+            if (buffered && (presentableStart != nil || anyLaneFull)) || allEOF {
+                // A lane whose media starts later (live TS joined mid-GOP:
+                // video waits for its first keyframe) would show nothing
+                // until the clock got there; start where every lane has
+                // something to present instead. The audio before it is
+                // dropped by the renderer as late.
+                let now = renderer.currentTime
+                if let start = presentableStart, MediaTime.isValid(now), start > now {
+                    renderer.setRate(targetRate, anchoredAt: start)
+                } else {
+                    renderer.setRate(targetRate)
+                }
                 state = .playing
             } else if state != .buffering {
                 state = .buffering
@@ -1233,5 +1252,29 @@ public actor PlayerSession {
         return !lanes.isEmpty && lanes.allSatisfy {
             $0.pipeline >= configuration.bufferTarget || $0.queueFull
         }
+    }
+
+    /// Some lane cannot buffer more: waiting for another lane's first frame
+    /// would only park the demuxer behind it (a video lane that never
+    /// decodes is the watchdog's to report, not the start gate's to hide).
+    private var anyLaneFull: Bool {
+        laneDepths.contains(where: \.queueFull)
+    }
+
+    /// The earliest time at which every active lane has media at its
+    /// renderer — the latest of their first enqueued PTS since the last
+    /// flush. nil while some lane has handed its renderer nothing yet.
+    private var presentableStart: Int64? {
+        let lowWater = renderer.enqueuedLowWaterMark
+        var marks: [Int64] = []
+        if videoDecoder != nil, !videoAtEOF {
+            guard MediaTime.isValid(lowWater.video) else { return nil }
+            marks.append(lowWater.video)
+        }
+        if audioDecoder != nil, !audioAtEOF {
+            guard MediaTime.isValid(lowWater.audio) else { return nil }
+            marks.append(lowWater.audio)
+        }
+        return marks.max()
     }
 }
