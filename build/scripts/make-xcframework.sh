@@ -37,9 +37,15 @@ for dirpath, _, files in os.walk(root):
             with open(path, 'w') as fh:
                 fh.write(rewritten)
 PYEOF
-    cp "$BUILD_DIR/support/CFFmpeg.h" "$slice/Headers/"
-    cp "$BUILD_DIR/support/CFFmpegShim.h" "$slice/Headers/"
-    cp "$BUILD_DIR/support/module.modulemap" "$slice/Headers/"
+    # The module map lives in Headers/CFFmpeg/, not at the Headers root: Xcode
+    # copies every static xcframework's Headers/ into one Products/<config>/include/,
+    # so a root module.modulemap collides with any other package that ships one
+    # (LibDovi, via AetherEngine in Lume). lume_ffmpeg/ stays at the root, where
+    # CFFmpeg.h's <lume_ffmpeg/...> includes resolve against the Headers search path.
+    mkdir -p "$slice/Headers/CFFmpeg"
+    cp "$BUILD_DIR/support/CFFmpeg.h" "$slice/Headers/CFFmpeg/"
+    cp "$BUILD_DIR/support/CFFmpegShim.h" "$slice/Headers/CFFmpeg/"
+    cp "$BUILD_DIR/support/module.modulemap" "$slice/Headers/CFFmpeg/"
 }
 
 # xcodebuild rejects two libraries for the same platform+variant, so arm64 and
