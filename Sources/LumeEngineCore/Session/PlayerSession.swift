@@ -75,6 +75,10 @@ public struct PlayerConfiguration: Sendable {
     /// Pass one to pin the width or drive it yourself, e.g. for a macOS
     /// multichannel interface.
     public var audioOutputRoute: AudioOutputRoute?
+    /// Sample the colours of presented frames from the start (see
+    /// `VideoSampleTap`); nil leaves sampling off — `renderer.videoSamples`
+    /// can still turn it on at runtime.
+    public var videoSampling: VideoSampleTap.Configuration?
 
     public init() {}
 }
@@ -107,6 +111,17 @@ public actor PlayerSession {
     /// Active subtitle cues (embedded track or external file). Query with
     /// `activeCues(at: renderer.currentTime)` from any thread.
     public nonisolated let subtitles = SubtitleStore()
+
+    /// Colour readings of presented frames (see `VideoSampleTap`); enable
+    /// with `PlayerConfiguration.videoSampling` or `videoSamples.isEnabled`.
+    public nonisolated var videoSamples: VideoSampleTap { renderer.videoSamples }
+
+    /// The sample of the frame on screen now: `videoSamples` read at the
+    /// renderer's clock. Any thread; nil while sampling is off or before a
+    /// sampled frame is shown.
+    public nonisolated func currentVideoSample() -> VideoSampleTap.Sample? {
+        renderer.videoSamples.sample(atOrBefore: renderer.currentTime)
+    }
 
     private(set) var state: State = .idle {
         didSet {
@@ -185,7 +200,11 @@ public actor PlayerSession {
     public init(configuration: PlayerConfiguration = PlayerConfiguration()) {
         self.configuration = configuration
         audioRoute = configuration.audioOutputRoute ?? AudioOutputRoute.system()
-        renderer = SystemRenderer(muted: configuration.muted, audioOutputRoute: audioRoute)
+        renderer = SystemRenderer(
+            muted: configuration.muted,
+            audioOutputRoute: audioRoute,
+            videoSampling: configuration.videoSampling
+        )
         var continuation: AsyncStream<PlayerEvent>.Continuation!
         events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         eventSink = continuation
