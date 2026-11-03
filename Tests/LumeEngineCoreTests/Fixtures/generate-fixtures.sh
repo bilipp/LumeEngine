@@ -22,6 +22,8 @@
 #   captions.ts    — H.264 TS with CEA-608 captions in A/53 SEI (1–3 s, 4–6 s; needs python3)
 #   pgs.mkv, dvbsub.ts, dvdsub.mkv — the same two bitmap subtitles (1–3 s, 4–6 s)
 #                    as PGS, DVB and DVD subtitles on a 1920x1080 canvas (needs python3)
+#   quadrant.mp4   — 2 s H.264 8-bit BT.709, four flat quadrants: red, green / blue, white
+#   quadrant10.mp4 — the same picture as HEVC Main 10 (10-bit frames for the colour sampler)
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -502,5 +504,25 @@ PY
         echo "skipped: bitmap subtitle fixtures (needs python3)" >&2
     fi
 fi
+
+# Four flat quadrants (red | green over blue | white) for the colour sampler
+# (`VideoSampleTap`): the RGB → Y'CbCr conversion is pinned to BT.709 limited
+# range and tagged so, which is what the sampler must undo. 320x180 keeps the
+# quadrant edges on even rows/columns, so 4:2:0 chroma never straddles them.
+QUADRANT_INPUTS=(
+    -f lavfi -i "color=c=red:size=160x90:rate=25:duration=2"
+    -f lavfi -i "color=c=lime:size=160x90:rate=25:duration=2"
+    -f lavfi -i "color=c=blue:size=160x90:rate=25:duration=2"
+    -f lavfi -i "color=c=white:size=160x90:rate=25:duration=2"
+)
+QUADRANT_FILTER="[0][1][2][3]xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0,scale=out_color_matrix=bt709:out_range=tv"
+QUADRANT_TAGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv)
+gen quadrant.mp4 \
+    "${QUADRANT_INPUTS[@]}" -filter_complex "$QUADRANT_FILTER,format=yuv420p" \
+    -c:v libx264 -preset ultrafast -crf 12 -g 25 "${QUADRANT_TAGS[@]}"
+gen quadrant10.mp4 \
+    "${QUADRANT_INPUTS[@]}" -filter_complex "$QUADRANT_FILTER,format=yuv420p10le" \
+    -c:v libx265 -preset ultrafast -crf 12 -tag:v hvc1 "${QUADRANT_TAGS[@]}" \
+    -x265-params "log-level=error:keyint=25"
 
 echo "fixtures ready in $OUT"

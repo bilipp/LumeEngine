@@ -98,8 +98,23 @@ public final class SystemRenderer: @unchecked Sendable {
     /// (see `pumpAudio`); nil feeds every frame.
     private let audioOutputRoute: AudioOutputRoute?
 
-    public init(muted: Bool = false, audioOutputRoute: AudioOutputRoute? = nil) {
+    /// Colour readings of the frames handed to the display, off unless
+    /// enabled (see `VideoSampleTap`). Read
+    /// `videoSamples.sample(atOrBefore: currentTime)` for what is on screen.
+    public let videoSamples: VideoSampleTap
+
+    /// - Parameter videoSampling: starts `videoSamples` enabled with this
+    ///   grid; nil leaves it off (it can still be enabled at runtime).
+    public init(
+        muted: Bool = false,
+        audioOutputRoute: AudioOutputRoute? = nil,
+        videoSampling: VideoSampleTap.Configuration? = nil
+    ) {
         self.audioOutputRoute = audioOutputRoute
+        videoSamples = VideoSampleTap(
+            configuration: videoSampling ?? VideoSampleTap.Configuration(),
+            enabled: videoSampling != nil
+        )
         displayLayer = AVSampleBufferDisplayLayer()
         displayLayer.videoGravity = .resizeAspect
         videoRenderer = displayLayer.sampleBufferRenderer
@@ -335,6 +350,7 @@ public final class SystemRenderer: @unchecked Sendable {
         videoCadence.restart()
         lock.unlock()
 
+        videoSamples.flush(acceptingSerial: serial)
         videoRenderer.flush()
         audioRenderer.flush()
     }
@@ -408,6 +424,7 @@ public final class SystemRenderer: @unchecked Sendable {
         synchronizer.setRate(0, time: .zero)
         videoRenderer.flush()
         audioRenderer.flush()
+        videoSamples.flush()
     }
 
     // MARK: Pumps (render queues)
@@ -432,6 +449,7 @@ public final class SystemRenderer: @unchecked Sendable {
             do {
                 let sample = try SampleBufferBuilder.video(from: frame, formatCache: &videoFormatCache)
                 videoRenderer.enqueue(sample)
+                videoSamples.offer(frame)
                 lock.lock()
                 lastEnqueuedVideoPTS = frame.pts
                 if !MediaTime.isValid(firstEnqueuedVideoPTS) { firstEnqueuedVideoPTS = frame.pts }
