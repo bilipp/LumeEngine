@@ -15,8 +15,8 @@ import PackageDescription
 // build/scripts/make-xcframework.sh writes exactly there, so anyone iterating on the
 // FFmpeg build tests their own binary rather than silently linking the released one.
 // Consumers never have that directory, so their resolution is unconditional.
-let ffmpegArtifactURL = "https://github.com/bilipp/LumeEngine/releases/download/v0.3.0/FFmpeg.xcframework.zip"
-let ffmpegArtifactChecksum = "4aed787a0cf05067395bb5b07f1af96c25e1314a841bc1597e37964dd009b5b0"
+let ffmpegArtifactURL = "https://github.com/bilipp/LumeEngine/releases/download/v0.5.0/FFmpeg.xcframework.zip"
+let ffmpegArtifactChecksum = "5538e79a33e466c749c8c2d2ae7cb8626aed46221a16a2946d241d44f756510f"
 
 let localFFmpegPath = "BinaryDependencies/FFmpeg.xcframework"
 let hasLocalFFmpeg = FileManager.default.fileExists(
